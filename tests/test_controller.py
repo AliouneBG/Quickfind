@@ -134,13 +134,13 @@ class TestController(unittest.TestCase):
         self.assertIn("Unknown", self.controller.app.status.cget("text"))
 
     def test_results_are_capped(self):
-        # A search fetches several pages so that scrolling has somewhere to
-        # go, but it is still bounded.
+        # The list is a viewport, so the cap is on how many matches it holds
+        # rather than on how many rows are drawn, but it is still a cap.
         self.cfg["max_results"] = 2
         self.controller.start(force_rebuild=True)
         self.wait_for_index()
         results, _ = self.controller.query("e")
-        self.assertLessEqual(len(results), 2 * quickfind.SCROLL_PAGES)
+        self.assertLessEqual(len(results), 2)
 
 
     def test_drain_stops_cleanly_after_destroy(self):

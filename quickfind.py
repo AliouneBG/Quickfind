@@ -28,7 +28,7 @@ DEFAULT_CONFIG = {
     "roots": ["C:\\"],
     "excludes": list(fsindex.DEFAULT_EXCLUDES),
     "supplement": list(fsindex.DEFAULT_SUPPLEMENT),
-    "max_results": 40,
+    "max_results": 2000,
     "opacity": 0.92,
     "fuzzy": True,
     "frecency": True,
@@ -44,9 +44,15 @@ DEFAULT_CONFIG = {
 }
 
 WARM_THRESHOLD = 50_000
-# How many pages of results a search fetches. The list renders one page and
-# adds the next as it is scrolled.
-SCROLL_PAGES = 8
+# How many matches the list holds. The list is a viewport, so this costs
+# result objects and nothing in widgets: materialising 2000 of them measured
+# 20.2ms against 19.3ms for 400.
+RESULT_POOL = 2000
+# What a keystroke fetches. The rest follows once typing pauses.
+QUICK_RESULTS = 400
+# What `max_results` meant before the list could scroll. A config written then
+# would otherwise cap the list at a screenful for ever.
+LEGACY_MAX_RESULTS = 40
 # How many newly created files are carried alongside the index, and how often
 # that small index is rebuilt while files are pouring in.
 FRESH_MAX = 3000
@@ -95,6 +101,15 @@ def load_config() -> dict:
         return cfg
 
     cfg.update(stored)
+    # `max_results` used to be how many rows were drawn, so forty was a sane
+    # value. The list is now a viewport and the setting caps how many matches
+    # it holds, so a config still carrying the old default would silently keep
+    # the list a screenful long. Only the untouched default is moved.
+    if stored.get("max_results") == LEGACY_MAX_RESULTS:
+        cfg["max_results"] = RESULT_POOL
+        stored = dict(stored)
+        stored.pop("max_results")
+
     if set(stored) != set(cfg):
         # Write back so newly added settings are visible and editable rather
         # than being silent defaults the user has no way to discover.
@@ -190,8 +205,7 @@ class Controller:
         self.usage = usage.UsageStore(enabled=cfg.get("frecency", True))
         self.app = ui.Launcher(self, opacity=cfg.get("opacity"),
                                preview=cfg.get("preview", True),
-                               video_preview=cfg.get("video_preview", True),
-                               page_rows=cfg.get("max_results", 40))
+                               video_preview=cfg.get("video_preview", True))
         self._events: queue.Queue = queue.Queue()
         self._indexing = False
         self._scanned = 0
@@ -429,12 +443,29 @@ class Controller:
         if self.searcher is None:
             return [], f"Indexing... {self._scanned:,} items"
 
+        # Enough to fill the screen and then some, quickly. The rest is
+        # fetched a moment later by `more`, off the typing path: resolving
+        # paths for two thousand matches costs about 10ms more per keystroke,
+        # and almost every query is refined again before anyone scrolls.
+        return self._search(text, min(QUICK_RESULTS, self.cfg["max_results"]))
+
+    def more(self, text: str):
+        """The rest of the matches, once the first screenful is on show.
+
+        Returns None when there is nothing to add. A longer search returns the
+        same rows in the same order for as far as the shorter one went, so the
+        list can be swapped underneath the viewport without anything moving.
+        """
+        text = text.strip()
+        if not text or text.startswith(":") or self.searcher is None:
+            return None
+        if self.cfg["max_results"] <= QUICK_RESULTS:
+            return None
+        results, note = self._search(text, self.cfg["max_results"])
+        return (results, note) if len(results) > QUICK_RESULTS else None
+
+    def _search(self, text: str, limit: int):
         started = time.perf_counter()
-        # Fetch several pages' worth. Scanning is what a search costs, and that
-        # is the same whether forty results or four hundred come back (14.9ms
-        # against 14.6ms measured), so there is no reason to make scrolling
-        # past the fortieth row wait for another search.
-        limit = self.cfg["max_results"] * SCROLL_PAGES
         results = self.searcher.search(text, limit,
                                        fuzzy=self.cfg.get("fuzzy", True))
         results, fresh_count = self._with_fresh(text, results)
@@ -448,13 +479,13 @@ class Controller:
         total = self.searcher.last_total
         if total is not None:
             total += fresh_count
-        page = self.cfg["max_results"]
+        screenful = getattr(self.app, "rows_visible", 10)
         if total is not None and total > len(results):
             more = "+" if self.searcher.last_total_capped else ""
             note = f"{len(results)} of {total:,}{more}"
             hint = "  Add a word to narrow"
-        elif len(results) > page:
-            # All of them are in the list; only the first page is on screen.
+        elif len(results) > screenful:
+            # All of them are in the list; only a screenful is on show.
             note = f"{len(results)} matches"
             hint = "  Scroll for more"
         else:

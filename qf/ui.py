@@ -33,10 +33,15 @@ SPI_GETWHEELSCROLLLINES = 0x0068
 WHEEL_PAGESCROLL = 0xFFFFFFFF
 DEFAULT_WHEEL_LINES = 3
 MAX_WHEEL_LINES = 24
-# Rows are added a page at a time as the list is scrolled, starting this many
-# rows before the end so the next page is already there when you arrive.
-EXTEND_MARGIN_ROWS = 6
-PAGE_ROWS = 40
+# The list is a viewport: only the rows on screen exist as widgets, however
+# many results there are. The folder column is measured once per search from
+# at most this many rows, so that it does not shift about while scrolling.
+COLUMN_SAMPLE_ROWS = 200
+
+# How long after a keystroke the rest of the matches are fetched. Long enough
+# that a burst of typing never pays for it, short enough to be ready well
+# before anyone reaches for the wheel.
+DEEPEN_MS = 120
 
 PREVIEW_WIDTH = 250
 PREVIEW_DELAY_MS = 180
@@ -253,15 +258,20 @@ def describe(path: str, is_dir: bool, type_name: str,
 
 class Launcher:
     def __init__(self, controller, opacity=None, preview=True,
-                 video_preview=True, page_rows=PAGE_ROWS):
+                 video_preview=True):
         enable_dpi_awareness()
         self.controller = controller
         self.preview_enabled = bool(preview)
-        self.page_rows = max(1, int(page_rows))
         self._wheel_lines = wheel_lines()
         self.alpha = min(1.0, max(MIN_ALPHA, ALPHA if opacity is None else opacity))
         self.results = []
+        # Where the viewport sits, and which result is selected. Both index
+        # the results, not the widgets.
+        self._top = 0
+        self._cursor = -1
+        self._column_px = 0
         self._after_id = None
+        self._deepen_id = None
         self._anim_id = None
         self._spin_id = None
         self._pump_id = None
@@ -399,9 +409,25 @@ class Launcher:
         # Drop the border and heading elements entirely.
         style.layout("QF.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
 
+        style.configure("QF.Vertical.TScrollbar", background=BORDER,
+                        troughcolor=BG, bordercolor=BG, arrowcolor=BG,
+                        darkcolor=BORDER, lightcolor=BORDER,
+                        borderwidth=0, arrowsize=0, width=self.px(6))
+        style.map("QF.Vertical.TScrollbar",
+                  background=[("active", DIM), ("!active", BORDER)])
+        style.layout("QF.Vertical.TScrollbar",
+                     [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+                         ("Vertical.Scrollbar.thumb",
+                          {"expand": "1", "sticky": "nswe"})]})])
+
         self.tree = ttk.Treeview(self.body, style="QF.Treeview", show="tree",
                                  selectmode="browse", height=self.rows_visible)
         self.tree.column("#0", stretch=True, anchor="w")
+        # The list is a viewport over the results, so the scrollbar is driven
+        # from the result count rather than from the widget's own contents.
+        self.scrollbar = ttk.Scrollbar(self.body, orient="vertical",
+                                       style="QF.Vertical.TScrollbar",
+                                       command=self._on_scrollbar)
         self.tree.pack(side="left", fill="both", expand=True)
 
         self._blank = tk.PhotoImage(width=1, height=1)
@@ -587,7 +613,21 @@ class Launcher:
         """Width left for row text once the icon and padding take their share."""
         return self.px(self.list_width) - self.px(64)
 
-    def _format_rows(self, results) -> list[str]:
+    def _column_for(self, results) -> int:
+        """The shared folder column for a whole result set.
+
+        Measured once per search over at most a few hundred rows. Recomputing
+        it from whatever is in view would make the folders shuffle sideways
+        every time the list scrolled.
+        """
+        available = self._row_budget()
+        cap = int(available * 0.45)
+        leads = [self._elide(r.name, cap - self.px(12), keep_tail=False)
+                 for r in results[:COLUMN_SAMPLE_ROWS]]
+        return min(cap, max((self._text_px(lead) for lead in leads), default=0)
+                   + self._text_px("    "))
+
+    def _format_rows(self, results, column=None) -> list[str]:
         """Name on the left, folders aligned to a shared column.
 
         A tree row is one string, so the gap is padded with spaces measured
@@ -605,8 +645,9 @@ class Launcher:
             leads.append(self._elide(result.name, cap - self.px(12),
                                      keep_tail=False))
 
-        column = min(cap, max((measure(lead) for lead in leads), default=0)
-                     + measure("    "))
+        if column is None:
+            column = min(cap, max((measure(lead) for lead in leads), default=0)
+                         + measure("    "))
         space_px = max(1, measure(" "))
 
         rows = []
@@ -1017,7 +1058,7 @@ class Launcher:
     def hide(self) -> None:
         self._visible = False
         self._cancel_anim()
-        for attr in ("_after_id", "_preview_id"):
+        for attr in ("_after_id", "_preview_id", "_deepen_id"):
             pending = getattr(self, attr)
             if pending is not None:
                 try:
@@ -1077,82 +1118,162 @@ class Launcher:
             return
         if self._after_id is not None:
             self.root.after_cancel(self._after_id)
+        if self._deepen_id is not None:
+            # Still typing: the longer fetch would only be thrown away.
+            try:
+                self.root.after_cancel(self._deepen_id)
+            except Exception:
+                pass
+            self._deepen_id = None
         self._after_id = self.root.after(DEBOUNCE_MS, self._run_search)
 
     def row_count(self) -> int:
-        return len(self.tree.get_children())
+        return len(self.results)
 
     def row_text(self, index: int) -> str:
-        items = self.tree.get_children()
-        return self.tree.item(items[index], "text")
+        """The text of a row, whether or not it currently has a widget."""
+        if 0 <= index < len(self.results):
+            return self._format_rows([self.results[index]])[0]
+        return ""
 
     def _run_search(self) -> None:
         self._after_id = None
         query = self.entry.get()
         self.results, note = self.controller.query(query)
-        self._render_rows(min(len(self.results), self.page_rows))
+        # One column width for the whole result set, measured once. Deriving
+        # it from whatever happens to be on screen would make the folders
+        # shuffle sideways as the list scrolled.
+        self._column_px = self._column_for(self.results)
+        # Back to the top. Leaving the view where the last search left it
+        # showed an empty stretch of list and hid the match that had just been
+        # selected.
+        self._top = 0
+        self._cursor = 0 if self.results else -1
+        self._paint()
         if self.results:
-            self._select(0)
-            # Back to the top. Leaving the view where the last search left it
-            # showed an empty stretch of list and hid the match that had just
-            # been selected.
-            self.tree.yview_moveto(0)
+            self._schedule_preview()
+            self._schedule_deepen()
         else:
             self._clear_preview()
         self.status.configure(text=note)
         self._sync_panels()
 
-    def _render_rows(self, wanted: int) -> None:
-        """Fill the tree with the first `wanted` results."""
-        # Reuse rows rather than clearing and rebuilding: recreating 40 tree
-        # items on every keystroke costs far more than reconfiguring them.
-        items = list(self.tree.get_children())
-        if wanted < len(items):
-            self.tree.selection_remove(*items)
-        self._row_keys = []
-        shown = self.results[:wanted]
-        texts = self._format_rows(shown)
+    def _schedule_deepen(self) -> None:
+        """Ask for the rest of the matches once typing has paused."""
+        if not hasattr(self.controller, "more"):
+            return
+        if self._deepen_id is not None:
+            try:
+                self.root.after_cancel(self._deepen_id)
+            except Exception:
+                pass
+        self._deepen_id = self.root.after(DEEPEN_MS, self._deepen)
 
-        for position, (result, text) in enumerate(zip(shown, texts)):
+    def _deepen(self) -> None:
+        self._deepen_id = None
+        query = self.entry.get()
+        try:
+            longer = self.controller.more(query)
+        except Exception:
+            return
+        if not longer:
+            return
+        results, note = longer
+        # Append what is new rather than swapping the list. A deeper search
+        # interleaves repeated names over a larger pool, so its order differs
+        # from the short one's; replacing outright would shuffle the rows
+        # under the pointer. Keeping what is on screen and adding the rest
+        # leaves the viewport, the selection and the ranking alone.
+        seen = {r.path for r in self.results}
+        extra = [r for r in results if r.path not in seen]
+        if not extra:
+            return
+        self.results = self.results + extra
+        self._paint()
+        self.status.configure(text=note)
+
+    # -- the viewport ------------------------------------------------------
+
+    def _visible_rows(self) -> int:
+        return max(1, min(self.rows_visible, len(self.results)))
+
+    def _max_top(self) -> int:
+        return max(0, len(self.results) - self._visible_rows())
+
+    def _paint(self) -> None:
+        """Write the rows in view into the handful of widgets that exist.
+
+        The list is a viewport, not a copy: a query matching fifty thousand
+        files still owns about a dozen tree items, and scrolling rewrites them
+        rather than creating more. Painting a screenful costs about a
+        millisecond, so it can happen on every wheel notch.
+        """
+        count = self._visible_rows() if self.results else 0
+        items = self._ensure_items(count)
+        rows = self.results[self._top:self._top + count]
+        texts = self._format_rows(rows, column=self._column_px)
+        self._row_keys = []
+        for item, result, text in zip(items, rows, texts):
             key = self._icons.key_for(result.path, result.is_dir)
             self._row_keys.append(key)
-            image = self._icon_images.get(key, self._blank)
-            if position < len(items):
-                self.tree.item(items[position], text=text, image=image)
-            else:
-                self.tree.insert("", "end", text=text, image=image)
+            self.tree.item(item, text=text,
+                           image=self._icon_images.get(key, self._blank))
             if key not in self._icon_images:
+                # Only what is on screen is worth a shell lookup.
                 self._request_icon(key, result.path, result.is_dir)
+        self._paint_selection(items)
+        self._sync_scrollbar()
 
-        for surplus in items[len(texts):]:
-            self.tree.delete(surplus)
+    def _ensure_items(self, count: int):
+        items = list(self.tree.get_children())
+        while len(items) > count:
+            self.tree.delete(items.pop())
+        while len(items) < count:
+            items.append(self.tree.insert("", "end", text="",
+                                          image=self._blank))
+        return items
 
-    def _extend_rows(self) -> bool:
-        """Show another page, if the search found more than is on screen."""
-        shown = len(self.tree.get_children())
-        if shown >= len(self.results):
-            return False
-        self._render_rows(min(len(self.results), shown + self.page_rows))
-        return True
+    def _paint_selection(self, items) -> None:
+        offset = self._cursor - self._top
+        if 0 <= offset < len(items):
+            self.tree.selection_set(items[offset])
+            self.tree.focus(items[offset])
+        elif items:
+            self.tree.selection_remove(*items)
+
+    def _sync_scrollbar(self) -> None:
+        total = len(self.results)
+        if total <= self._visible_rows():
+            if self.scrollbar.winfo_ismapped():
+                self.scrollbar.pack_forget()
+            return
+        if not self.scrollbar.winfo_ismapped():
+            # Only shown when there is something to scroll: it doubles as the
+            # signal that the list holds more than a screenful.
+            self.scrollbar.pack(side="right", fill="y", before=self.tree)
+        first = self._top / total
+        self.scrollbar.set(first, (self._top + self._visible_rows()) / total)
+
+    def _scroll_to(self, top: int) -> None:
+        top = max(0, min(self._max_top(), int(top)))
+        if top == self._top:
+            return
+        self._top = top
+        self._paint()
 
     def _on_wheel(self, event) -> str:
-        """Scroll by the number of rows Windows is set to, then top up."""
+        """Scroll by however many rows Windows is configured for."""
         notches = -event.delta / 120.0
-        self.tree.yview_scroll(int(round(notches * self._wheel_lines)), "units")
-        if notches > 0:
-            self._extend_near_end()
+        self._scroll_to(self._top + notches * self._wheel_lines)
         return "break"
 
-    def _extend_near_end(self) -> None:
-        shown = len(self.tree.get_children())
-        if shown >= len(self.results):
-            return
-        # Derived from the top of the view and the number of rows on screen.
-        # The bottom fraction Tk reports is stale until it has laid the widget
-        # out again, and comes back as zero mid-scroll.
-        first_visible = self.tree.yview()[0] * shown
-        if first_visible + self.rows_visible >= shown - EXTEND_MARGIN_ROWS:
-            self._extend_rows()
+    def _on_scrollbar(self, action, value, unit=None) -> None:
+        """Drive the viewport from the scrollbar."""
+        if action == "moveto":
+            self._scroll_to(round(float(value) * len(self.results)))
+        elif action == "scroll":
+            step = self._visible_rows() if unit == "pages" else 1
+            self._scroll_to(self._top + int(value) * step)
 
     def set_status(self, text: str) -> None:
         if not self.alive():
@@ -1164,47 +1285,45 @@ class Launcher:
     # -- interaction -------------------------------------------------------
 
     def _selected(self) -> int:
-        chosen = self.tree.selection()
-        if not chosen:
-            return -1
-        try:
-            return self.tree.index(chosen[0])
-        except tk.TclError:
-            return -1
+        """Index into the results, not into the widgets on screen."""
+        if 0 <= self._cursor < len(self.results):
+            return self._cursor
+        return -1
 
     def _select(self, target: int) -> None:
         if not self.results:
             return
-        items = self.tree.get_children()
-        if not items:
+        target = max(0, min(len(self.results) - 1, int(target)))
+        if target == self._cursor:
             return
-        # Walking off the end of what is rendered pulls in the next page
-        # rather than stopping dead at row forty.
-        while target > len(items) - 1 and self._extend_rows():
-            items = self.tree.get_children()
-        target = max(0, min(len(items) - 1, target))
-        if self._selected() == target:
-            return
-        self.tree.selection_set(items[target])
-        self.tree.focus(items[target])
+        self._cursor = target
+        self._reveal_cursor()
+        self._paint()
         self._schedule_preview()
+
+    def _reveal_cursor(self) -> None:
+        """Move the viewport the least it can to put the cursor on screen."""
+        visible = self._visible_rows()
+        if self._cursor < self._top:
+            self._top = self._cursor
+        elif self._cursor >= self._top + visible:
+            self._top = self._cursor - visible + 1
+        self._top = max(0, min(self._max_top(), self._top))
 
     def _move(self, delta: int) -> str:
         if not self.results:
             return "break"
         current = self._selected()
         self._select((current if current >= 0 else 0) + delta)
-        chosen = self.tree.selection()
-        if chosen:
-            self.tree.see(chosen[0])
         return "break"
 
     def _row_at(self, y: int) -> int:
+        """Which result is under the pointer, counting from the viewport."""
         item = self.tree.identify_row(y)
         if not item:
             return -1
         try:
-            return self.tree.index(item)
+            return self._top + self.tree.index(item)
         except tk.TclError:
             return -1
 

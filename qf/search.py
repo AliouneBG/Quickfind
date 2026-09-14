@@ -37,7 +37,13 @@ from bisect import bisect_right
 
 MAX_SCAN_HITS = 12000
 MAX_PATH_PROBES = 6000
-REFINE_POOL = 400
+# The most matches that will ever be turned into results. Resolving a path is
+# the cost here, and the list is a viewport that draws a dozen rows however
+# long it is, so this is what the user can scroll through.
+REFINE_POOL = 2000
+# The smallest pool that still gives `_spread` room to interleave repeated
+# names, whatever limit the caller asked for.
+SPREAD_POOL = 400
 
 FUZZY_TRIGGER = 8      # only when substring results are genuinely sparse
 FUZZY_MIN_LEN = 3
@@ -333,6 +339,10 @@ class Searcher:
             return []
 
         self._now = time.time()
+        # Resolving a path is what a result costs, so only build as many as
+        # were asked for. The floor keeps the interleaving in `_spread` a fair
+        # fight even when the caller wants a handful.
+        pool = min(REFINE_POOL, max(limit, SPREAD_POOL))
         tokens = query.split()
         primary_text, rest = tokens[0], tokens[1:]
         primary = primary_text.encode("utf-8")
@@ -423,7 +433,7 @@ class Searcher:
                 final = min(final, FUZZY_CEILING)
             results.append(Result(i, name_of(i), full_path,
                                   bool(isdir[i]), final, fuzzy=is_fuzzy))
-            if len(results) >= REFINE_POOL:
+            if len(results) >= pool:
                 break
 
         results.sort(key=lambda r: -r.score)

@@ -64,15 +64,15 @@ Clicking away also dismisses it. The preview pane follows the selection, and a
 selected video holds its thumbnail for a moment and then plays a silent
 preview.
 
-The list holds more than it shows. Forty rows are rendered to start with and
-another forty arrive as you scroll toward the end, up to eight pages, so a
-search you cannot immediately narrow is still worth scrolling through.
+The list holds far more than it shows. Only the rows on screen exist as
+widgets, so a search matching thousands of files scrolls as smoothly as one
+matching ten, and the scrollbar shows how much is really there.
 
 The status line reports how many files matched, not just how many fit on
-screen. Typing `resume` on a machine with hundreds of them reads `320 of 535`
-and suggests adding a word, because a second word filters by folder and
-usually cuts the list to one. When everything matched is in the list but not on
-screen, it says so and invites scrolling instead.
+screen. Typing `resume` on a machine with hundreds of them reads `535 matches`
+and invites scrolling; when there are more than the list can hold it reads
+`2000 of 12,000+` and suggests adding a word, because a second word filters by
+folder and usually cuts the list to one.
 
 The tray icon has Show, Rebuild index, and Quit. On Windows 11 new tray icons
 start hidden behind the `^` chevron, so drag it out if you want it pinned.
@@ -141,7 +141,7 @@ file automatically, so the file always shows everything available.
 | `roots` | `["C:\\"]` | What to index |
 | `excludes` | `$recycle.bin`, ... | Folder names the directory walk skips |
 | `supplement` | `["C:\\Windows"]` | Walked after an MFT build to recover hardlink names |
-| `max_results` | `40` | Rows rendered at a time. Scrolling adds more, up to eight pages |
+| `max_results` | `2000` | How many matches the list holds. Only the rows on screen are drawn, so this costs little |
 | `opacity` | `0.92` | Window transparency, from `0.35` to `1.0` |
 | `fuzzy` | `true` | Abbreviation fallback |
 | `frecency` | `true` | Rank what you have opened before higher |
@@ -233,7 +233,7 @@ on-disk cache is 53 MB.
 | `quickfind.py` | Entry point, config, elevation, and the Controller |
 | `qf/fsindex.py` | MFT enumeration, directory walk, packed storage, cache |
 | `qf/search.py` | Haystack scanning, ranking, abbreviation fallback |
-| `qf/ui.py` | Tk overlay, DPI scaling, rows, scrolling, preview pane |
+| `qf/ui.py` | Tk overlay, DPI scaling, the virtual list, preview pane |
 | `qf/shellicon.py` | Shell icons and thumbnails, encoded to PNG for Tk |
 | `qf/videopreview.py` | Silent video frames decoded with Media Foundation |
 | `qf/freshwatch.py` | Watches the folders files land in, no privileges needed |
@@ -283,11 +283,38 @@ exactly one row per notch, and on a ten row list that is wading. QuickFind
 binds the wheel itself and scrolls by however many lines Windows is configured
 for, three by default.
 
-Fetching more results costs nothing worth having: a search spends its time
-scanning, and that is the same whether forty results or four hundred come back
-(14.9 ms against 14.6 ms measured). So a search fetches eight pages, the list
-renders one, and the next is rendered when scrolling comes within six rows of
-the end. Rendering a page costs about 15 ms and only happens on arrival there.
+### The list is a viewport
+
+However many matches a search finds, the list owns about a dozen tree items:
+one per row on screen. Scrolling rewrites those items rather than creating
+more, so the cost of moving through the list does not depend on how long it
+is. Two thousand results traverse end to end in 664 wheel notches at **1.0 ms
+a notch**, with ten widgets alive throughout.
+
+That means everything that indexes the list has to index the results, not the
+widgets. `_top` is the first result on screen and `_cursor` is the selected
+result; the Tk selection is set on whichever item is currently showing the
+cursor, and cleared when it has been scrolled past. Hovering maps the pointer
+to `_top + row`. The scrollbar is driven from the result count rather than
+from the widget's own contents, so its thumb shows the true size of the list,
+and it only appears when there is something to scroll.
+
+The folder column is measured once per search rather than per paint. Deriving
+it from whatever happens to be in view would make the folders shuffle sideways
+every time the list moved.
+
+### Fetching in two steps
+
+Resolving a path is what a result costs, so a search that materialises two
+thousand of them spends about 10 ms more than one that stops at four hundred.
+Almost every query is refined again before anyone scrolls, so a keystroke
+fetches four hundred and the rest follows 120 ms after typing stops, cancelled
+if another key arrives.
+
+The deeper search is not swapped in wholesale. It interleaves repeated names
+over a larger pool, so its order differs from the quick one's, and replacing
+the list would shuffle rows under the pointer. What is already on screen stays
+exactly where it is and only genuinely new rows are appended.
 
 ### Icons and the preview pane
 
@@ -526,7 +553,7 @@ hold on any machine.
 ## Development
 
 ```sh
-python -m unittest discover -s tests     # 432 tests
+python -m unittest discover -s tests     # 455 tests
 python quickfind.py --bench report       # time a query
 python quickfind.py --selftest-mft       # verify MFT enumeration (needs admin)
 ```

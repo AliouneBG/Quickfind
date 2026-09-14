@@ -79,6 +79,9 @@ class TestStatusLine(unittest.TestCase):
             _fresh_dirty = False
             _refresh_fresh = quickfind.Controller._refresh_fresh
             _with_fresh = quickfind.Controller._with_fresh
+            _search = quickfind.Controller._search
+            # The list draws a screenful at a time, whatever it holds.
+            app = type("Pane", (), {"rows_visible": 10})()
 
         stub = Stub()
         stub.searcher = searcher
@@ -98,7 +101,7 @@ class TestStatusLine(unittest.TestCase):
     def test_a_scrollable_list_says_so(self):
         # Everything that matched is in the list, but not on one screen.
         paths = [rf"C:\bucket\note{n:03d}.txt" for n in range(60)]
-        _results, note = self.build(paths, "note")
+        _results, note = self.build(paths, "note", limit=2000)
         self.assertIn("60 matches", note)
         self.assertIn("Scroll for more", note)
 
