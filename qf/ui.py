@@ -11,7 +11,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
 
-from . import shellicon
+from . import shellicon, videopreview
 from .usage import OPEN_WEIGHT, REVEAL_WEIGHT
 
 BG = "#1b1c22"
@@ -32,6 +32,10 @@ PREVIEW_WIDTH = 250
 PREVIEW_DELAY_MS = 180
 PREVIEW_THUMB = 132
 ICON_PUMP_MS = 50
+# A short silent clip, decoded on the worker and cycled as images.
+VIDEO_FRAMES = 16
+VIDEO_FPS = 10.0
+VIDEO_BOX = 190          # logical px; the pane is 250 wide
 
 # Fonts are given in pixels (negative sizes). Point sizes would be multiplied by
 # Tk's own DPI scaling, which is ~1.33 on Windows and made everything oversized.
@@ -146,7 +150,8 @@ def describe(path: str, is_dir: bool, type_name: str) -> str:
 
 
 class Launcher:
-    def __init__(self, controller, opacity=None, preview=True):
+    def __init__(self, controller, opacity=None, preview=True,
+                 video_preview=True):
         enable_dpi_awareness()
         self.controller = controller
         self.preview_enabled = bool(preview)
@@ -172,6 +177,10 @@ class Launcher:
         self._worker = None
         self._preview_token = 0
         self._preview_image = None
+        self._video_frames = []
+        self._video_index = 0
+        self._video_id = None
+        self.video_enabled = bool(video_preview)
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -509,6 +518,17 @@ class Launcher:
                     _, token, path, is_dir = job
                     self._done.put(("preview", token, self._build_preview_data(
                         path, is_dir)))
+                elif kind == "video":
+                    _, token, path, box = job
+                    # Decoding a clip costs about a second. Sweeping down a
+                    # list of videos would queue one per row, and the row you
+                    # stopped on would wait behind all of them.
+                    if token != self._preview_token:
+                        continue
+                    width, height, pngs = videopreview.frames(
+                        path, size=box, count=VIDEO_FRAMES, fps=VIDEO_FPS)
+                    if pngs:
+                        self._done.put(("video", token, pngs))
             except Exception:
                 pass
 
@@ -527,6 +547,7 @@ class Launcher:
             "is_thumbnail": is_thumbnail,
             "meta": describe(path, is_dir, type_name),
             "excerpt": "" if is_dir else read_excerpt(path),
+            "is_video": (not is_dir) and videopreview.is_video(path),
         }
 
     def _pump(self) -> None:
@@ -550,6 +571,10 @@ class Launcher:
                     token, info = payload
                     if token == self._preview_token:
                         self._show_preview(info)
+                elif kind == "video":
+                    token, pngs = payload
+                    if token == self._preview_token:
+                        self._start_video(pngs)
         except queue.Empty:
             pass
         if self.alive():
@@ -598,6 +623,7 @@ class Launcher:
                         result.is_dir))
 
     def _show_preview(self, info: dict) -> None:
+        self._stop_video()
         excerpt = info.get("excerpt", "")
         # A generic page glyph tells you nothing a code excerpt does not; give
         # the space to the text. A real thumbnail earns its place.
@@ -633,7 +659,58 @@ class Launcher:
             self.preview_text.pack_forget()
         self.preview_text.configure(state="disabled")
 
+        # The still thumbnail is already up; decoding motion takes about a
+        # second, so it is requested separately rather than delaying everything.
+        if self.video_enabled and info.get("is_video") and show_image:
+            box = (self.preview_width - self.px(16), self.px(VIDEO_BOX))
+            self._ensure_worker()
+            self._jobs.put(("video", self._preview_token, info["path"], box))
+
+    def _start_video(self, pngs) -> None:
+        """Swap the still for a looping clip."""
+        self._stop_video()
+        images = []
+        for data in pngs:
+            try:
+                images.append(tk.PhotoImage(data=data))
+            except tk.TclError:
+                return
+        if not images:
+            return
+        self._video_frames = images
+        self._video_index = 0
+        if not self.preview_image_label.winfo_ismapped():
+            self.preview_image_label.pack(before=self.preview_name,
+                                          pady=(self.px(14), self.px(8)))
+        self._advance_video()
+
+    def _advance_video(self) -> None:
+        self._video_id = None
+        if not self._video_frames or not self.alive():
+            return
+        frame = self._video_frames[self._video_index % len(self._video_frames)]
+        self._video_index += 1
+        try:
+            self.preview_image_label.configure(image=frame)
+        except tk.TclError:
+            return
+        self._video_id = self.root.after(int(1000 / VIDEO_FPS),
+                                         self._advance_video)
+
+    def _stop_video(self) -> None:
+        if self._video_id is not None:
+            try:
+                self.root.after_cancel(self._video_id)
+            except Exception:
+                pass
+            self._video_id = None
+        # Dropping the PhotoImages matters: sixteen frames of a pane-width clip
+        # is several megabytes inside Tk.
+        self._video_frames = []
+        self._video_index = 0
+
     def _clear_preview(self) -> None:
+        self._stop_video()
         self._preview_token += 1
         self._preview_image = None
         self.preview_image_label.configure(image="")
@@ -734,6 +811,7 @@ class Launcher:
                 except Exception:
                     pass
                 setattr(self, attr, None)
+        self._stop_video()
         self._anim_offset = 0
         self.root.withdraw()
         self.root.attributes("-alpha", 0.0)
@@ -749,6 +827,7 @@ class Launcher:
         self._visible = False
         self._busy = False
         self._cancel_anim()
+        self._stop_video()
         for attr in ("_after_id", "_spin_id", "_pump_id", "_preview_id"):
             pending = getattr(self, attr)
             if pending is not None:

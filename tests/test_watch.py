@@ -6,15 +6,13 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     import tkinter as tk
-    _probe = tk.Tk()
-    _probe.destroy()
-    del _probe
-    TK_AVAILABLE = True
 except Exception:
-    TK_AVAILABLE = False
+    tk = None
+from _tkcheck import TK_AVAILABLE, make
 
 import quickfind
 from qf import fsindex, watcher
@@ -59,7 +57,7 @@ class TestRefreshDebounce(unittest.TestCase):
         self.cfg = dict(quickfind.DEFAULT_CONFIG)
         self.cfg.update({"roots": [self.tmp.name], "excludes": [],
                          "watch_quiet_seconds": 5, "min_rebuild_seconds": 60})
-        self.controller = quickfind.Controller(self.cfg)
+        self.controller = make(lambda: quickfind.Controller(self.cfg))
         self.rebuilds = []
         self.controller._rebuild = lambda: self.rebuilds.append(time.time())
 

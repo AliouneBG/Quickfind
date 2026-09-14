@@ -4,16 +4,13 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     import tkinter as tk
-    _probe = tk.Tk()
-    _probe.destroy()
-    del _probe
-    gc.collect()
-    TK_AVAILABLE = True
 except Exception:
-    TK_AVAILABLE = False
+    tk = None
+from _tkcheck import TK_AVAILABLE, make
 
 from qf import search, ui
 
@@ -51,7 +48,7 @@ class TestLauncher(unittest.TestCase):
             StubResult("draft.docx", "C:\\Users\\me\\reports\\draft.docx"),
         ]
         self.controller = StubController(self.results)
-        self.app = ui.Launcher(self.controller)
+        self.app = make(lambda: ui.Launcher(self.controller))
 
     def tearDown(self):
         try:
@@ -155,7 +152,7 @@ class TestLauncherWithRealSearcher(unittest.TestCase):
             def command(self, text):
                 pass
 
-        self.app = ui.Launcher(RealController())
+        self.app = make(lambda: ui.Launcher(RealController()))
 
     def tearDown(self):
         try:
@@ -181,7 +178,7 @@ class TestLauncherWithRealSearcher(unittest.TestCase):
 @unittest.skipUnless(TK_AVAILABLE, "no Tk display available")
 class TestChrome(unittest.TestCase):
     def setUp(self):
-        self.app = ui.Launcher(StubController([]))
+        self.app = make(lambda: ui.Launcher(StubController([])))
 
     def tearDown(self):
         try:
@@ -231,7 +228,7 @@ class TestChrome(unittest.TestCase):
         self.assertEqual(self.app.alpha, ui.ALPHA)
 
     def test_opacity_is_configurable(self):
-        app = ui.Launcher(StubController([]), opacity=0.7)
+        app = make(lambda: ui.Launcher(StubController([]), opacity=0.7))
         try:
             self.assertAlmostEqual(app.alpha, 0.7)
         finally:
@@ -240,7 +237,7 @@ class TestChrome(unittest.TestCase):
 
     def test_opacity_is_clamped_to_usable_range(self):
         for given, expected in ((0.01, ui.MIN_ALPHA), (5.0, 1.0), (1.0, 1.0)):
-            app = ui.Launcher(StubController([]), opacity=given)
+            app = make(lambda: ui.Launcher(StubController([]), opacity=given))
             try:
                 self.assertAlmostEqual(app.alpha, expected,
                                        msg=f"opacity {given} should clamp")
@@ -301,7 +298,7 @@ class TestChrome(unittest.TestCase):
 @unittest.skipUnless(TK_AVAILABLE, "no Tk display available")
 class TestRowFitting(unittest.TestCase):
     def setUp(self):
-        self.app = ui.Launcher(StubController([]))
+        self.app = make(lambda: ui.Launcher(StubController([])))
 
     def tearDown(self):
         try:

@@ -64,7 +64,8 @@ class TestLoadConfig(unittest.TestCase):
 
     def test_defaults_cover_every_setting_the_app_reads(self):
         for key in ("hotkey", "roots", "excludes", "supplement", "max_results", "opacity",
-                    "fuzzy", "preview", "tray", "elevate", "refresh_after_hours"):
+                    "fuzzy", "preview", "video_preview", "tray", "elevate",
+                    "refresh_after_hours"):
             self.assertIn(key, quickfind.DEFAULT_CONFIG)
 
 

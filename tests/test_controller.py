@@ -5,16 +5,13 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     import tkinter as tk
-    _probe = tk.Tk()
-    _probe.destroy()
-    del _probe
-    gc.collect()
-    TK_AVAILABLE = True
 except Exception:
-    TK_AVAILABLE = False
+    tk = None
+from _tkcheck import TK_AVAILABLE, make
 
 import quickfind
 
@@ -49,7 +46,7 @@ class TestController(unittest.TestCase):
         self._real_cache_path = quickfind.fsindex.cache_path
         quickfind.fsindex.cache_path = lambda: self.cache
 
-        self.controller = quickfind.Controller(self.cfg)
+        self.controller = make(lambda: quickfind.Controller(self.cfg))
 
     def tearDown(self):
         quickfind.fsindex.cache_path = self._real_cache_path
@@ -109,7 +106,7 @@ class TestController(unittest.TestCase):
         self.wait_for_index()
         self.assertTrue(os.path.exists(self.cache))
 
-        fresh = quickfind.Controller(self.cfg)
+        fresh = make(lambda: quickfind.Controller(self.cfg))
         try:
             fresh.start(force_rebuild=False)
             self.assertIsNotNone(fresh.searcher, "cached index not loaded synchronously")

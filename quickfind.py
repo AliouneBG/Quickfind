@@ -32,6 +32,7 @@ DEFAULT_CONFIG = {
     "fuzzy": True,
     "frecency": True,
     "preview": True,
+    "video_preview": True,
     "tray": True,
     "elevate": True,
     "watch": True,
@@ -179,7 +180,8 @@ class Controller:
         self.searcher: search.Searcher | None = None
         self.usage = usage.UsageStore(enabled=cfg.get("frecency", True))
         self.app = ui.Launcher(self, opacity=cfg.get("opacity"),
-                               preview=cfg.get("preview", True))
+                               preview=cfg.get("preview", True),
+                               video_preview=cfg.get("video_preview", True))
         self._events: queue.Queue = queue.Queue()
         self._indexing = False
         self._scanned = 0

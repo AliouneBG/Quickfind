@@ -14,6 +14,7 @@ library, so there is nothing to install, no virtualenv, and no build step.
 * Ranking that prefers apps, your own files, and things you have opened before.
 * Windows shell icons on every row.
 * Preview pane with thumbnails for images and video, and text excerpts for code.
+* Videos play a short silent clip in the preview, so you can tell which one it is.
 * Live index updates through the NTFS change journal when running as admin.
 * Tray icon, single-instance handling, and a config file.
 
@@ -58,7 +59,8 @@ Undo that with `--uninstall-task`.
 | `Ctrl+Enter` | Show it in Explorer |
 | `Esc` | Dismiss |
 
-Clicking away also dismisses it. The preview pane follows the selection.
+Clicking away also dismisses it. The preview pane follows the selection, and a
+selected video starts playing a short silent clip about a second later.
 
 The status line reports how many files matched, not just how many fit on
 screen. Typing `resume` on a machine with hundreds of them reads `40 of 535`
@@ -137,6 +139,7 @@ file automatically, so the file always shows everything available.
 | `fuzzy` | `true` | Abbreviation fallback |
 | `frecency` | `true` | Rank what you have opened before higher |
 | `preview` | `true` | Preview pane. Turning it off narrows the window |
+| `video_preview` | `true` | Play a short silent clip when a video is selected |
 | `tray` | `true` | Notification area icon |
 | `elevate` | `true` | Ask for administrator at startup |
 | `watch` | `true` | Live index updates via the NTFS change journal |
@@ -224,6 +227,7 @@ on-disk cache is 53 MB.
 | `qf/search.py` | Haystack scanning, ranking, abbreviation fallback |
 | `qf/ui.py` | Tk overlay, DPI scaling, rows, preview pane |
 | `qf/shellicon.py` | Shell icons and thumbnails, encoded to PNG for Tk |
+| `qf/videopreview.py` | Silent video frames decoded with Media Foundation |
 | `qf/usage.py` | Frecency store of what you opened and how recently |
 | `qf/hotkey.py` | `RegisterHotKey` on its own message loop |
 | `qf/tray.py` | `Shell_NotifyIcon` with a message-only window |
@@ -282,6 +286,38 @@ on the standard library.
 When the shell has no real thumbnail it offers a generic page glyph. Requesting
 `SIIGBF_THUMBNAILONLY` first tells the two apart, so a source file shows its
 code rather than a blank page.
+
+### Video previews
+
+A single frame often cannot tell two recordings apart, so selecting a video
+plays a short silent clip in the preview pane. Tk has no video widget, so
+`qf/videopreview.py` decodes sixteen real frames with Media Foundation and the
+UI cycles them at 10 frames per second. Only the video stream is read, so there
+is no audio to mute.
+
+Three decisions keep it fast enough to run on a hover:
+
+* **The decoder scales, not Python.** The source reader is asked for a small
+  RGB32 output instead of the native size. Letting Media Foundation scale during
+  conversion took a 1920x1080 decode from 1819 ms to 114 ms. The requested size
+  keeps the source aspect ratio, since a fixed size makes the reader stretch.
+* **One seek, then read forward.** Seeking to each frame in turn costs a fresh
+  run from the preceding keyframe every time. Seeking once to 15% of the
+  duration and reading consecutively is far cheaper. Running forward to that
+  exact time is bounded, because on a long group of pictures it consumed the
+  whole read budget and returned nothing.
+* **Stale work is dropped, not decoded.** A clip costs about a second, so
+  sweeping down a list of videos would queue one decode per row. The worker
+  compares each job's token against the current selection and skips it.
+
+Opening frames that are a flat colour are passed over, so a video that starts on
+a black card does not preview as a black rectangle. Decoding stops after 1.5
+seconds and animates whatever arrived, and a file Media Foundation cannot open
+simply keeps its still thumbnail.
+
+Across a 50 video sample on the development machine, decoding took a median of
+703 ms and at worst 1557 ms, all of it on the worker thread with the still
+thumbnail already on screen.
 
 ### How search stays fast
 
@@ -352,7 +388,7 @@ hold on any machine.
 ## Development
 
 ```sh
-python -m unittest discover -s tests     # 285 tests
+python -m unittest discover -s tests     # 326 tests
 python quickfind.py --bench report       # time a query
 python quickfind.py --selftest-mft       # verify MFT enumeration (needs admin)
 ```
@@ -389,6 +425,16 @@ there is no console, so a startup failure would otherwise leave no trace.
 * **Children of a withdrawn window are never mapped**, so `winfo_ismapped`
   assertions in tests pass or fail for the wrong reason unless the window is
   shown first.
+* **Media Foundation only offers the codec's own format** unless the source
+  reader is created with `MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING`.
+  Without it, asking for RGB32 returns `MF_E_INVALIDMEDIATYPE`.
+* **Ask for a positive stride rather than reading one.** Row order is not
+  fixed, and a scaled output type publishes no `MF_MT_DEFAULT_STRIDE` to read.
+  The default differed between a webm and an mkv, so one of them always came
+  out upside down until the top-down stride was requested explicitly.
+* **Seeking lands on a keyframe, not your timestamp.** The next samples read
+  back are earlier than the time you asked for, which looks like a broken seek
+  until you read forward.
 
 ### Matching against paths, and why it is not done
 
@@ -419,3 +465,5 @@ fixes that actually worked were removing the false signals ahead of it.
   `supplement` directories are findable only under the single name NTFS reports.
   Adding a directory to `supplement` fixes it for that tree.
 * Untested on ReFS and FAT32. Both fall back to the directory walk.
+* Video previews depend on the codecs Windows has. Anything Media Foundation
+  cannot open, such as ProRes, keeps its still thumbnail instead.

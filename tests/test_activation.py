@@ -6,16 +6,13 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     import tkinter as tk
-    _probe = tk.Tk()
-    _probe.destroy()
-    del _probe
-    gc.collect()
-    TK_AVAILABLE = True
 except Exception:
-    TK_AVAILABLE = False
+    tk = None
+from _tkcheck import TK_AVAILABLE, make
 
 from qf import ui
 
@@ -54,7 +51,7 @@ class TestSelectionSurvives(unittest.TestCase):
     def setUp(self):
         self.rows = [Row("Downloads", r"C:\Users\me\Downloads", is_dir=True),
                      Row("a.txt", r"C:\a.txt")]
-        self.app = ui.Launcher(Stub(self.rows))
+        self.app = make(lambda: ui.Launcher(Stub(self.rows)))
 
     def tearDown(self):
         self.app.shutdown()
@@ -108,7 +105,7 @@ class TestBindingsAreGlobal(unittest.TestCase):
     """Clicking a row moves focus; activation keys must still work."""
 
     def setUp(self):
-        self.app = ui.Launcher(Stub([Row("a.txt", r"C:\a.txt")]))
+        self.app = make(lambda: ui.Launcher(Stub([Row("a.txt", r"C:\a.txt")])))
 
     def tearDown(self):
         self.app.shutdown()
@@ -148,7 +145,7 @@ class TestBindingsAreGlobal(unittest.TestCase):
 class TestMouse(unittest.TestCase):
     def setUp(self):
         self.rows = [Row(f"file{i}.txt", rf"C:\x\file{i}.txt") for i in range(6)]
-        self.app = ui.Launcher(Stub(self.rows))
+        self.app = make(lambda: ui.Launcher(Stub(self.rows)))
         self.app.show()
         self.app.entry.insert(0, "file")
         self.app._run_search()
@@ -203,7 +200,7 @@ class TestMouse(unittest.TestCase):
 class TestMissingPaths(unittest.TestCase):
     def setUp(self):
         self.rows = [Row("gone.txt", r"C:\definitely\not\here.txt")]
-        self.app = ui.Launcher(Stub(self.rows))
+        self.app = make(lambda: ui.Launcher(Stub(self.rows)))
         self.app.show()
         self.app.entry.insert(0, "gone")
         self.app._run_search()

@@ -7,16 +7,13 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     import tkinter as tk
-    _probe = tk.Tk()
-    _probe.destroy()
-    del _probe
-    gc.collect()
-    TK_AVAILABLE = True
 except Exception:
-    TK_AVAILABLE = False
+    tk = None
+from _tkcheck import TK_AVAILABLE, make
 
 from qf import shellicon, ui
 
@@ -55,7 +52,7 @@ class TestPngEncoder(unittest.TestCase):
     def test_round_trips_through_tk(self):
         if not TK_AVAILABLE:
             self.skipTest("no Tk")
-        root = tk.Tk()
+        root = make(tk.Tk)
         root.withdraw()
         try:
             pixels = bytes([255, 0, 0, 255] * 4)
@@ -183,7 +180,7 @@ class TestIconPipeline(unittest.TestCase):
     def setUp(self):
         self.rows = [Row("a.txt", r"C:\x\a.txt"), Row("b.txt", r"C:\y\b.txt"),
                      Row("docs", r"C:\docs", is_dir=True)]
-        self.app = ui.Launcher(Stub(self.rows))
+        self.app = make(lambda: ui.Launcher(Stub(self.rows)))
         self.app._ensure_worker = lambda: None      # no real shell calls
         self.app.entry.insert(0, "q")
         self.app._run_search()
@@ -231,7 +228,7 @@ class TestIconPipeline(unittest.TestCase):
 class TestPreviewPane(unittest.TestCase):
     def setUp(self):
         self.rows = [Row("a.txt", r"C:\x\a.txt"), Row("b.txt", r"C:\y\b.txt")]
-        self.app = ui.Launcher(Stub(self.rows))
+        self.app = make(lambda: ui.Launcher(Stub(self.rows)))
         self.app._ensure_worker = lambda: None
         self.app.entry.insert(0, "q")
         self.app._run_search()
