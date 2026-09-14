@@ -178,6 +178,51 @@ class TestBlankFrames(unittest.TestCase):
         self.assertTrue(videopreview._is_blank(b""))
 
 
+class TestFrameComparison(unittest.TestCase):
+    """Spotting a stretch where nothing moves, which plays as a freeze."""
+
+    def frame(self, pixel, count=4000):
+        return bytes(pixel) * count
+
+    def test_a_frame_does_not_differ_from_itself(self):
+        raw = self.frame([12, 80, 200, 0])
+        self.assertEqual(videopreview._difference(
+            videopreview._sampled(raw), videopreview._sampled(raw)), 0.0)
+
+    def test_black_against_white_is_the_full_range(self):
+        black = videopreview._sampled(self.frame([0, 0, 0, 0]))
+        white = videopreview._sampled(self.frame([255, 255, 255, 0]))
+        self.assertEqual(videopreview._difference(black, white), 255.0)
+
+    def test_a_small_change_reads_small(self):
+        a = videopreview._sampled(self.frame([100, 100, 100, 0]))
+        b = videopreview._sampled(self.frame([101, 100, 100, 0]))
+        self.assertLess(videopreview._difference(a, b),
+                        videopreview.STILL_DIFFERENCE)
+
+    def test_a_real_change_clears_the_threshold(self):
+        a = videopreview._sampled(self.frame([100, 100, 100, 0]))
+        b = videopreview._sampled(self.frame([140, 100, 100, 0]))
+        self.assertGreater(videopreview._difference(a, b),
+                           videopreview.STILL_DIFFERENCE)
+
+    def test_empty_input_is_no_difference(self):
+        self.assertEqual(videopreview._difference(b"", b"abc"), 0.0)
+
+    def test_sampling_stays_on_one_channel(self):
+        # Mixing in the padding byte would make a white frame look like a
+        # high-contrast one.
+        self.assertEqual(videopreview.SAMPLE_STEP % 4, 0)
+
+    def test_the_hunt_is_bounded(self):
+        # Unbounded, a video where nothing ever moves spends the whole time
+        # budget looking for motion and never decodes its later runs.
+        self.assertGreater(videopreview.STILL_SKIP_BUDGET, 0)
+        self.assertLess(videopreview.STILL_SKIP_BUDGET,
+                        videopreview.MAX_READS_PER_FRAME
+                        * videopreview.DEFAULT_PER_SEGMENT)
+
+
 class TestDecoding(unittest.TestCase):
     """Against real files, because the COM plumbing is the risky part."""
 
@@ -258,6 +303,15 @@ class TestDecoding(unittest.TestCase):
                                              on_segment=once)
         self.assertEqual(len(handed), 1)
         self.assertEqual(len(runs), 1)
+
+    def test_frames_within_a_run_actually_move(self):
+        # A run of near-identical frames is what made a preview look like it
+        # had paused; the decoder should skip ahead rather than keep copies.
+        _w, _h, runs = videopreview.segments(self.clips[0], size=(160, 160),
+                                             count=2, per_segment=6)
+        for run in runs:
+            self.assertEqual(len(set(run)), len(run),
+                             "a run repeated a frame")
 
     def test_a_short_clip_is_played_straight_through(self):
         # Six one second runs would cut holes in a clip only a few seconds

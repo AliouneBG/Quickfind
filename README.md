@@ -358,7 +358,7 @@ Four decisions keep it fast enough to run on a hover:
   bounded, because on a long group of pictures it consumed the whole read
   budget and returned nothing.
 * **Runs are handed over as they finish.** The preview starts playing after the
-  first run, about 800 ms in, and lengthens as the rest arrive. Nobody waits
+  first run, about 900 ms in, and lengthens as the rest arrive. Nobody waits
   for the full decode.
 * **Stale work is abandoned, not decoded.** A full preview costs a few seconds,
   so sweeping down a list of videos would queue one decode per row. The worker
@@ -387,13 +387,34 @@ A complete preview holds around a hundred `PhotoImage` objects, about 50 MB
 inside Tk, all of it released the moment the selection moves.
 
 Opening frames that are a flat colour are passed over, so a video that starts on
-a black card does not preview as a black rectangle. Decoding stops after eight
+a black card does not preview as a black rectangle. Decoding stops after ten
 seconds and animates whatever arrived, and a file Media Foundation cannot open
 simply keeps its still thumbnail.
 
 Across a 24 video sample on the development machine, motion appeared after a
-median of 802 ms and the full six run preview took a median of 4.3 seconds, all
+median of 884 ms and the full six run preview took a median of 4.9 seconds, all
 of it on the worker thread with the still thumbnail already on screen.
+
+### Runs that do not move
+
+A run that lands on a static shot plays as eighteen copies of one picture, which
+looks like the preview freezing and then resuming when the loop reaches the next
+run. This was not rare: on a sample of the machine's own videos, 18 of 42 runs
+moved less than 1.0 on a 0 to 255 scale between frames.
+
+So the decoder compares each frame against the last one it kept, on a sampled
+byte in every 388, and when nothing has changed it skips ahead instead of
+keeping another copy. The lookahead doubles each time it finds nothing, up to
+eight frames' worth, which walks the run forward to wherever something actually
+happens.
+
+The hunt is bounded at twenty skipped frames per run. Unbounded it fixed more
+freezes, but a video where genuinely nothing moves spent the whole time budget
+looking, and the runs that then never got decoded cost more than the stillness
+did. At twenty, every video with motion still yields its full six runs, and
+frozen runs fell from 18 of 42 to 10 of 42. Six of the ten remaining belong to
+one video that is a single static shot throughout, which no amount of looking
+can improve.
 
 ### How search stays fast
 
@@ -464,7 +485,7 @@ hold on any machine.
 ## Development
 
 ```sh
-python -m unittest discover -s tests     # 396 tests
+python -m unittest discover -s tests     # 404 tests
 python quickfind.py --bench report       # time a query
 python quickfind.py --selftest-mft       # verify MFT enumeration (needs admin)
 ```

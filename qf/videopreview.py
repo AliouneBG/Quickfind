@@ -63,10 +63,24 @@ MAX_READS_PER_FRAME = 40
 MAX_CATCH_UP_READS = 60
 MAX_BLANK_SKIPS = 8
 BLANK_RANGE = 10           # a frame this flat carries no information
-# A 4K clip decodes far slower than a 720p one. Rather than stall the
-# preview worker, stop early and animate however many frames arrived. Runs are
-# handed over as they finish, so a preview is already playing well before this.
-DEFAULT_BUDGET_SECONDS = 6.0
+SAMPLE_STEP = 4 * 97       # bytes apart, for comparing frames cheaply
+# Eighteen copies of the same picture is a preview that appears to freeze and
+# then resume when the loop reaches the next run, and 18 of 42 sampled runs on
+# this machine's videos moved less than 1.0 between frames. When nothing
+# changes, look further ahead rather than keeping another copy: the step
+# doubles up to MAX_STILL_STEP. The hunt is bounded per run, because a video
+# where genuinely nothing moves would otherwise spend the whole time budget
+# looking, and the runs that never get decoded cost more than the stillness
+# does.
+STILL_DIFFERENCE = 1.2
+STILL_STEP_GROWTH = 2.0
+MAX_STILL_STEP = 8.0
+STILL_SKIP_BUDGET = 20
+# A 4K clip decodes far slower than a 720p one. Rather than stall the preview
+# worker forever, stop and animate however many frames arrived. Runs are handed
+# over as they finish, so a preview is already playing well before this, and
+# the decode is abandoned outright when the selection moves.
+DEFAULT_BUDGET_SECONDS = 10.0
 
 
 class GUID(ctypes.Structure):
@@ -137,17 +151,33 @@ def is_video(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS
 
 
-def _is_blank(raw: bytes, step: int = 4 * 97) -> bool:
-    """Is this frame a flat colour? Sampled, so it costs almost nothing.
+def _sampled(raw: bytes) -> bytes:
+    """Every SAMPLE_STEPth byte, for comparing frames cheaply.
 
     The step is a multiple of four so that every sample is the same channel:
     the fourth byte of RGB32 is padding and is always zero, and mixing it in
     would make a white frame look like a high-contrast one.
     """
-    sample = raw[::step]
+    return raw[::SAMPLE_STEP]
+
+
+def _is_flat(sample: bytes) -> bool:
     if not sample:
         return True
     return max(sample) - min(sample) <= BLANK_RANGE
+
+
+def _is_blank(raw: bytes) -> bool:
+    """Is this frame a single flat colour?"""
+    return _is_flat(_sampled(raw))
+
+
+def _difference(a: bytes, b: bytes) -> float:
+    """Mean absolute difference between two sampled frames, 0 to 255."""
+    n = min(len(a), len(b))
+    if not n:
+        return 0.0
+    return sum(abs(x - y) for x, y in zip(a, b)) / n
 
 
 def _bgra_to_png(raw: bytes, width: int, height: int, flip: bool) -> bytes:
@@ -361,6 +391,9 @@ def _run(reader, read, start, count, fps, width, height, flip, deadline):
     reads = 0
     budget = count * MAX_READS_PER_FRAME
     out = []
+    previous = None
+    still_step = 1.0
+    skipped = 0
     while len(out) < count and reads < budget:
         # A file that yields nothing must give up too, or it ties up the
         # worker that every other preview shares.
@@ -386,13 +419,24 @@ def _run(reader, read, start, count, fps, width, height, flip, deadline):
             raw = _sample_bytes(sample)
             if raw is None:
                 continue
+            current = _sampled(raw)
             # Plenty of clips open on a black or white card, and a scene
             # change can land on one too. Opening a run there tells the viewer
             # nothing, so a few are passed over before taking what is there.
-            if not out and blanks_left and _is_blank(raw):
+            if not out and blanks_left and _is_flat(current):
                 blanks_left -= 1
                 next_wanted = seconds + interval
                 continue
+            # Nothing has changed since the last frame kept, so skip ahead
+            # instead of filling the preview with copies of one picture.
+            if (previous is not None and skipped < STILL_SKIP_BUDGET
+                    and _difference(current, previous) < STILL_DIFFERENCE):
+                skipped += 1
+                still_step = min(MAX_STILL_STEP, still_step * STILL_STEP_GROWTH)
+                next_wanted = seconds + interval * still_step
+                continue
+            still_step = 1.0
+            previous = current
             next_wanted = seconds + interval
             out.append(_bgra_to_png(raw, width, height, flip))
         finally:
