@@ -26,7 +26,11 @@ HALF_LIFE_DAYS = 30.0
 
 MAX_ENTRIES = 2000
 OPEN_WEIGHT = 1.0
-REVEAL_WEIGHT = 0.4
+# Revealing counts the same as opening. Both mean "this is the file I was
+# looking for"; the only difference is what you do with it next. Weighting
+# reveal lower punished the perfectly normal habit of navigating to a file
+# rather than launching it.
+REVEAL_WEIGHT = 1.0
 
 
 def default_path() -> str:

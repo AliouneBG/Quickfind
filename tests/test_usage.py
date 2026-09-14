@@ -48,11 +48,20 @@ class TestRecording(StoreTest):
             self.store.record(r"C:\a\hot.txt")
         self.assertLessEqual(self.store.boost(r"c:\a\hot.txt"), usage.MAX_BOOST)
 
-    def test_reveal_counts_less_than_open(self):
+    def test_reveal_counts_the_same_as_open(self):
+        # Both mean "this is the file I wanted"; only the follow-up differs.
         self.store.record(r"C:\a\opened.txt", usage.OPEN_WEIGHT)
         self.store.record(r"C:\a\revealed.txt", usage.REVEAL_WEIGHT)
-        self.assertGreater(self.store.boost(r"c:\a\opened.txt"),
-                           self.store.boost(r"c:\a\revealed.txt"))
+        self.assertAlmostEqual(self.store.boost(r"c:\a\opened.txt"),
+                               self.store.boost(r"c:\a\revealed.txt"), places=3)
+
+    def test_weights_still_scale_below_one(self):
+        # The curve must keep working for fractional weights, in case a weaker
+        # signal is ever added back.
+        self.store._entries[r"c:\a\weak.txt"] = [0.25, time.time()]
+        self.store._entries[r"c:\a\full.txt"] = [1.0, time.time()]
+        self.assertLess(self.store.boost(r"c:\a\weak.txt"),
+                        self.store.boost(r"c:\a\full.txt"))
 
     def test_old_entries_decay(self):
         self.store.record(r"C:\a\stale.txt")

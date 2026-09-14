@@ -331,11 +331,21 @@ class Controller:
         if not results:
             return [], f"No matches  ({elapsed_ms:.0f} ms)"
         approx = sum(1 for r in results if r.fuzzy)
-        note = f"{len(results)} shown"
+        # Say how many matched, not just how many fit. Typing "resume" on this
+        # machine matches 535 files; showing "40 shown" implied that was all of
+        # them, and gave no hint that a second word would cut it to one.
+        total = self.searcher.last_total
+        if total is not None and total > len(results):
+            more = "+" if self.searcher.last_total_capped else ""
+            note = f"{len(results)} of {total:,}{more}"
+            hint = "  Add a word to narrow"
+        else:
+            note = f"{len(results)} shown"
+            hint = ""
         if approx:
             note += f" ({approx} approximate)"
         suffix = " - indexing in background" if self._indexing else ""
-        return results, (f"{note}  ({elapsed_ms:.0f} ms)"
+        return results, (f"{note}  ({elapsed_ms:.0f} ms){hint}"
                          f"  Enter opens, Ctrl+Enter reveals{suffix}")
 
     def command(self, text: str) -> None:

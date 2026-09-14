@@ -60,6 +60,11 @@ Undo that with `--uninstall-task`.
 
 Clicking away also dismisses it. The preview pane follows the selection.
 
+The status line reports how many files matched, not just how many fit on
+screen. Typing `resume` on a machine with hundreds of them reads `40 of 535`
+and suggests adding a word, because a second word filters by folder and
+usually cuts the list to one.
+
 The tray icon has Show, Rebuild index, and Quit. On Windows 11 new tray icons
 start hidden behind the `^` chevron, so drag it out if you want it pinned.
 
@@ -100,9 +105,12 @@ Type a colon to run a command instead of searching.
 ### It learns what you open
 
 Opening something through QuickFind is remembered, and that file ranks higher
-next time. One open is worth about as much as matching on a word boundary. A
-file you open often reaches the cap. The boost halves every 30 days, so last
+next time. One open is worth about as much as matching on a word boundary, and
+a file you open often reaches the cap. The boost halves every 30 days, so last
 month's habits fade behind this month's.
+
+Showing a file in Explorer with `Ctrl+Enter` counts exactly the same as opening
+it. Both mean you found what you were after, and only the follow-up differs.
 
 This is deliberately bounded. History reorders comparable matches but never
 promotes something that does not match, so searching `alpha` will not surface
@@ -324,7 +332,12 @@ rules, in rough order of weight:
    last, so eight vendored copies of `shared.txt` cannot bury the one file with
    a distinct name. The best copy still comes first, because spreading runs
    after scoring.
-6. **What you have opened before.** Bounded and decaying, so it settles ties
+6. **When it was last edited.** Recently changed files rank higher, halving
+   every 45 days. This is what separates several versions of a document when
+   the name carries no signal at all. It is skipped inside package
+   directories, because updating an editor restamps thousands of bundled files
+   at once and that is not you working on them.
+7. **What you have opened before.** Bounded and decaying, so it settles ties
    between otherwise equal matches. This is most of what makes a launcher feel
    like it knows what you meant. One open lifted a file from rank 3 to rank 1
    among five identically scored siblings.
@@ -339,7 +352,7 @@ hold on any machine.
 ## Development
 
 ```sh
-python -m unittest discover -s tests     # 270 tests
+python -m unittest discover -s tests     # 285 tests
 python quickfind.py --bench report       # time a query
 python quickfind.py --selftest-mft       # verify MFT enumeration (needs admin)
 ```
@@ -376,6 +389,23 @@ there is no console, so a startup failure would otherwise leave no trace.
 * **Children of a withdrawn window are never mapped**, so `winfo_ismapped`
   assertions in tests pass or fail for the wrong reason unless the window is
   shown first.
+
+### Matching against paths, and why it is not done
+
+Searching also matches folder names would let `adobe` find the resume inside a
+folder called Adobe. It was measured rather than assumed, and rejected twice:
+
+* A full-path haystack would cost **83 MB**, because paths average 110
+  characters against 20 for names. That roughly doubles memory and makes every
+  scan five times longer.
+* Rewarding files whose parent folder also matches sounded cheaper and scored
+  worse. It dropped the ranking evaluation from 13 of 13 to 9 of 13, because
+  a project folder named after the query fills the results with its source
+  files.
+
+The case that prompted it turned out to be a ranking problem rather than a
+recall one: the wanted file was already in the candidate pool at rank 49. The
+fixes that actually worked were removing the false signals ahead of it.
 
 ## Limitations
 

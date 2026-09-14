@@ -114,6 +114,11 @@ class Searcher:
         self._last_primary = ""
         self._last_hits: list[int] | None = None
         self._now = time.time()
+        # Name matches for the most recent single-word query, so the UI can say
+        # "40 of 535" instead of implying 40 is all there is. None when a
+        # multi-word query makes the figure meaningless.
+        self.last_total = None
+        self.last_total_capped = False
         self.build()
 
     def build(self) -> None:
@@ -284,9 +289,11 @@ class Searcher:
             if ("\\appdata\\" not in lowered_path
                     or "\\appdata\\local\\programs\\" in lowered_path):
                 score += HOME_BONUS
+        noisy = False
         for marker in NOISE:
             if marker in lowered_path:
                 score -= 260.0
+                noisy = True
                 break
         for marker, penalty in DEMOTED:
             if marker in lowered_path:
@@ -295,12 +302,17 @@ class Searcher:
         # matches rather than promoting something irrelevant.
         if self.usage is not None:
             score += self.usage.boost(lowered_path)
-        mtime = self.index.mtimes[i] if i < len(self.index.mtimes) else 0
-        if mtime:
-            age_days = (self._now - mtime) / 86400.0
-            if age_days < 0:
-                age_days = 0.0
-            score += RECENCY_BONUS * (0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS))
+        # Recency means "you were working on this". Inside a package directory
+        # it means nothing of the sort: updating an editor restamps thousands
+        # of bundled files at once, which made its icons look freshly edited.
+        if not noisy:
+            mtime = self.index.mtimes[i] if i < len(self.index.mtimes) else 0
+            if mtime:
+                age_days = (self._now - mtime) / 86400.0
+                if age_days < 0:
+                    age_days = 0.0
+                score += RECENCY_BONUS * (0.5 ** (age_days
+                                                  / RECENCY_HALF_LIFE_DAYS))
         if rest:
             lowered_name = self.index.name(i).lower()
             for token in rest:
@@ -316,6 +328,8 @@ class Searcher:
         if not query:
             self._last_primary = ""
             self._last_hits = None
+            self.last_total = None
+            self.last_total_capped = False
             return []
 
         self._now = time.time()
@@ -353,6 +367,11 @@ class Searcher:
         # a whole stem then counts as exact.
         stem_exact = len(tokens) == 1 and b"." not in primary
         base = self._base_score
+        # Only meaningful for a single word: with further words the count of
+        # name matches is not the count of results.
+        self.last_total = len(candidates) if not rest else None
+        self.last_total_capped = capped
+
         scored = [(base(start, query_bytes, primary, stem_exact), start)
                   for start in candidates]
 
