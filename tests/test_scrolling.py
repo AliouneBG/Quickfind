@@ -2,6 +2,7 @@
 import gc
 import os
 import sys
+import threading
 import time
 import unittest
 from unittest import mock
@@ -16,6 +17,22 @@ except Exception:
 from _tkcheck import TK_AVAILABLE, make
 
 from qf import ui
+
+
+def deepen(app, timeout=2.0):
+    """Run the deeper search and wait for its answer to reach the UI.
+
+    It runs on a thread of its own now, so that a 40ms search does not stall
+    the window between keystrokes. The launcher collects the answer on its
+    ordinary 50ms tick; here the wait is explicit.
+    """
+    app._deepen()
+    end = time.time() + timeout
+    while app._deep_done.empty() and time.time() < end:
+        time.sleep(0.002)
+    app._drain_deep()
+
+
 
 
 class Row:
@@ -279,7 +296,7 @@ class TestViewport(unittest.TestCase):
         """
         app = self.launcher(self.rows(400))
         app.controller.more = lambda text: (self.rows(2000), "2000 matches")
-        app._deepen()
+        deepen(app)
         self.assertEqual(app.row_count(), 2000)
 
     def test_deepening_leaves_the_viewport_where_it_was(self):
@@ -287,14 +304,14 @@ class TestViewport(unittest.TestCase):
         app._scroll_to(200)
         app._select(205)
         app.controller.more = lambda text: (self.rows(2000), "2000 matches")
-        app._deepen()
+        deepen(app)
         self.assertEqual(app._top, 200)
         self.assertEqual(app._selected(), 205)
 
     def test_deepening_updates_the_status_line(self):
         app = self.launcher(self.rows(400))
         app.controller.more = lambda text: (self.rows(2000), "2000 matches")
-        app._deepen()
+        deepen(app)
         self.assertIn("2000 matches", app.status.cget("text"))
 
     # -- saying what each row is -------------------------------------------
@@ -383,19 +400,19 @@ class TestViewport(unittest.TestCase):
         before = [r.path for r in app.results]
         reordered = list(reversed(self.rows(400))) + self.rows(600)[400:]
         app.controller.more = lambda text: (reordered, "600 matches")
-        app._deepen()
+        deepen(app)
         self.assertEqual([r.path for r in app.results[:400]], before)
 
     def test_a_shorter_answer_adds_nothing(self):
         app = self.launcher(self.rows(400))
         app.controller.more = lambda text: (self.rows(10), "10 matches")
-        app._deepen()
+        deepen(app)
         self.assertEqual(app.row_count(), 400)
 
     def test_the_same_file_is_never_listed_twice(self):
         app = self.launcher(self.rows(400))
         app.controller.more = lambda text: (self.rows(600), "600 matches")
-        app._deepen()
+        deepen(app)
         paths = [r.path for r in app.results]
         self.assertEqual(len(paths), len(set(paths)))
         self.assertEqual(app.row_count(), 600)
@@ -403,7 +420,35 @@ class TestViewport(unittest.TestCase):
     def test_nothing_to_add_changes_nothing(self):
         app = self.launcher(self.rows(400))
         app.controller.more = lambda text: None
+        deepen(app)
+        self.assertEqual(app.row_count(), 400)
+
+    def test_the_longer_search_does_not_run_on_the_ui_thread(self):
+        # It used to, and at 250ms a character it ran between every pair of
+        # keystrokes, freezing the window for 40-60ms each time.
+        app = self.launcher(self.rows(400))
+        threads = []
+
+        def more(text):
+            threads.append(threading.current_thread().name)
+            return self.rows(600), "600 matches"
+
+        app.controller.more = more
+        deepen(app)
+        self.assertEqual(app.row_count(), 600)
+        self.assertNotIn(threading.current_thread().name, threads)
+
+    def test_an_answer_for_a_query_already_typed_over_is_dropped(self):
+        app = self.launcher(self.rows(400))
+        app.controller.more = lambda text: (self.rows(600), "600 matches")
         app._deepen()
+        end = time.time() + 2.0
+        while app._deep_done.empty() and time.time() < end:
+            time.sleep(0.002)
+        # The search came back, but by now the box says something else.
+        app.entry.delete(0, "end")
+        app.entry.insert(0, "something else entirely")
+        app._drain_deep()
         self.assertEqual(app.row_count(), 400)
 
     def test_a_controller_without_deepening_is_fine(self):

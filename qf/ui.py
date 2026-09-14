@@ -47,10 +47,14 @@ MAX_WHEEL_LINES = 24
 COLUMN_SAMPLE_ROWS = 200
 SCROLL_HINT = "  Scroll for more"
 
-# How long after a keystroke the rest of the matches are fetched. Long enough
-# that a burst of typing never pays for it, short enough to be ready well
-# before anyone reaches for the wheel.
-DEEPEN_MS = 120
+# How long after a keystroke the rest of the matches are fetched. This was
+# 120ms, which is shorter than the gap between keystrokes at any human typing
+# speed: measured at 250ms a character, a deep search ran between every pair of
+# them and cost 42-64ms each time. 350ms is longer than a fast typist's gap, so
+# it now runs when typing has actually stopped -- and even then off the UI
+# thread. Nobody can scroll past the first two hundred rows in a third of a
+# second, so having them later costs nothing.
+DEEPEN_MS = 350
 
 PREVIEW_WIDTH = 250
 PREVIEW_DELAY_MS = 180
@@ -326,6 +330,13 @@ class Launcher:
         self._jobs: queue.Queue = queue.Queue()
         self._done: queue.Queue = queue.Queue()
         self._worker = None
+        # The deeper search gets a thread to itself rather than sharing the
+        # shell worker: a cold icon takes 250ms, and a search queued behind a
+        # screenful of them would arrive long after it was wanted.
+        self._deep_jobs: queue.Queue = queue.Queue()
+        self._deep_done: queue.Queue = queue.Queue()
+        self._deep_worker = None
+        self._deep_seq = 0
         self._preview_token = 0
         self._preview_image = None
         self._video_frames = []
@@ -856,6 +867,7 @@ class Launcher:
                         self._extend_video(pngs)
         except queue.Empty:
             pass
+        self._drain_deep()
         if self.alive():
             self._pump_id = self.root.after(ICON_PUMP_MS, self._pump)
 
@@ -1248,6 +1260,7 @@ class Launcher:
                     pass
                 setattr(self, attr, None)
         self._jobs.put(None)
+        self._deep_jobs.put(None)
 
     def alive(self) -> bool:
         try:
@@ -1331,13 +1344,47 @@ class Launcher:
         self._deepen_id = self.root.after(DEEPEN_MS, self._deepen)
 
     def _deepen(self) -> None:
+        """Hand the longer search to its worker and get out of the way."""
         self._deepen_id = None
-        query = self.entry.get()
-        try:
-            longer = self.controller.more(query)
-        except Exception:
+        if not hasattr(self.controller, "more"):
             return
-        if not longer:
+        self._ensure_deep_worker()
+        self._deep_seq += 1
+        self._deep_jobs.put((self._deep_seq, self.entry.get()))
+
+    def _ensure_deep_worker(self) -> None:
+        if self._deep_worker is None or not self._deep_worker.is_alive():
+            self._deep_worker = threading.Thread(
+                target=self._deep_work, daemon=True, name="quickfind-deepen")
+            self._deep_worker.start()
+
+    def _deep_work(self) -> None:
+        while True:
+            job = self._deep_jobs.get()
+            if job is None:
+                return
+            seq, query = job
+            # Typed again while this waited: the answer is already stale.
+            if seq != self._deep_seq:
+                continue
+            try:
+                longer = self.controller.more(query)
+            except Exception:
+                longer = None
+            self._deep_done.put((seq, query, longer))
+
+    def _drain_deep(self) -> None:
+        """Take whatever the deeper search has finished, on the UI thread."""
+        try:
+            while True:
+                seq, query, longer = self._deep_done.get_nowait()
+                if seq == self._deep_seq:
+                    self._apply_deeper(query, longer)
+        except queue.Empty:
+            pass
+
+    def _apply_deeper(self, query: str, longer) -> None:
+        if not longer or query != self.entry.get():
             return
         results, note = longer
         # Append what is new rather than swapping the list. A deeper search
