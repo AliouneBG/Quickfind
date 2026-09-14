@@ -33,8 +33,11 @@ PREVIEW_DELAY_MS = 180
 PREVIEW_THUMB = 132
 ICON_PUMP_MS = 50
 # A short silent clip, decoded on the worker and cycled as images.
-VIDEO_FRAMES = 16
-VIDEO_FPS = 10.0
+# Six runs of twelve frames, sampled across the clip: six seconds of playback
+# showing six different moments rather than one and a half seconds of one.
+VIDEO_SEGMENTS = 6
+VIDEO_PER_SEGMENT = 12
+VIDEO_FPS = 12.0
 VIDEO_BOX = 190          # logical px; the pane is 250 wide
 
 # Fonts are given in pixels (negative sizes). Point sizes would be multiplied by
@@ -520,15 +523,25 @@ class Launcher:
                         path, is_dir)))
                 elif kind == "video":
                     _, token, path, box = job
-                    # Decoding a clip costs about a second. Sweeping down a
-                    # list of videos would queue one per row, and the row you
+                    # Decoding a clip costs a couple of seconds. Sweeping down
+                    # a list of videos would queue one per row, and the row you
                     # stopped on would wait behind all of them.
                     if token != self._preview_token:
                         continue
-                    width, height, pngs = videopreview.frames(
-                        path, size=box, count=VIDEO_FRAMES, fps=VIDEO_FPS)
-                    if pngs:
+                    # Hand each run over as it lands: the preview starts
+                    # playing after the first, about half a second in, and
+                    # grows as the rest arrive. Returning False abandons the
+                    # decode the moment the selection moves on.
+                    def deliver(width, height, pngs, token=token):
+                        if token != self._preview_token:
+                            return False
                         self._done.put(("video", token, pngs))
+                        return True
+
+                    videopreview.segments(
+                        path, size=box, count=VIDEO_SEGMENTS,
+                        per_segment=VIDEO_PER_SEGMENT, fps=VIDEO_FPS,
+                        on_segment=deliver)
             except Exception:
                 pass
 
@@ -574,7 +587,7 @@ class Launcher:
                 elif kind == "video":
                     token, pngs = payload
                     if token == self._preview_token:
-                        self._start_video(pngs)
+                        self._extend_video(pngs)
         except queue.Empty:
             pass
         if self.alive():
@@ -669,6 +682,10 @@ class Launcher:
     def _start_video(self, pngs) -> None:
         """Swap the still for a looping clip."""
         self._stop_video()
+        self._extend_video(pngs)
+
+    def _extend_video(self, pngs) -> None:
+        """Add a decoded run, starting playback if this is the first one."""
         images = []
         for data in pngs:
             try:
@@ -677,7 +694,11 @@ class Launcher:
                 return
         if not images:
             return
-        self._video_frames = images
+        playing = bool(self._video_frames)
+        self._video_frames.extend(images)
+        if playing:
+            # Already looping; the new run simply lengthens the loop.
+            return
         self._video_index = 0
         if not self.preview_image_label.winfo_ismapped():
             self.preview_image_label.pack(before=self.preview_name,
@@ -704,8 +725,8 @@ class Launcher:
             except Exception:
                 pass
             self._video_id = None
-        # Dropping the PhotoImages matters: sixteen frames of a pane-width clip
-        # is several megabytes inside Tk.
+        # Dropping the PhotoImages matters: a full preview of a pane-width clip
+        # is 54 frames and about 25MB inside Tk.
         self._video_frames = []
         self._video_index = 0
 

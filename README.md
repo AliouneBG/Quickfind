@@ -14,7 +14,7 @@ library, so there is nothing to install, no virtualenv, and no build step.
 * Ranking that prefers apps, your own files, and things you have opened before.
 * Windows shell icons on every row.
 * Preview pane with thumbnails for images and video, and text excerpts for code.
-* Videos play a short silent clip in the preview, so you can tell which one it is.
+* Videos play a silent six second preview sampled from across the clip.
 * New downloads and saved files are findable within a second, no admin needed.
 * Live index updates through the NTFS change journal when running as admin.
 * Tray icon, single-instance handling, and a config file.
@@ -61,7 +61,7 @@ Undo that with `--uninstall-task`.
 | `Esc` | Dismiss |
 
 Clicking away also dismisses it. The preview pane follows the selection, and a
-selected video starts playing a short silent clip about a second later.
+selected video starts playing a silent preview about a second later.
 
 The status line reports how many files matched, not just how many fit on
 screen. Typing `resume` on a machine with hundreds of them reads `40 of 535`
@@ -140,7 +140,7 @@ file automatically, so the file always shows everything available.
 | `fuzzy` | `true` | Abbreviation fallback |
 | `frecency` | `true` | Rank what you have opened before higher |
 | `preview` | `true` | Preview pane. Turning it off narrows the window |
-| `video_preview` | `true` | Play a short silent clip when a video is selected |
+| `video_preview` | `true` | Play a silent preview when a video is selected |
 | `tray` | `true` | Notification area icon |
 | `elevate` | `true` | Ask for administrator at startup |
 | `watch` | `true` | Live index updates via the NTFS change journal |
@@ -328,34 +328,53 @@ and ranked first.
 ### Video previews
 
 A single frame often cannot tell two recordings apart, so selecting a video
-plays a short silent clip in the preview pane. Tk has no video widget, so
-`qf/videopreview.py` decodes sixteen real frames with Media Foundation and the
-UI cycles them at 10 frames per second. Only the video stream is read, so there
-is no audio to mute.
+plays a silent preview in the pane. Tk has no video widget, so
+`qf/videopreview.py` decodes real frames with Media Foundation and the UI
+cycles them at 12 frames per second. Only the video stream is read, so there is
+no audio to mute.
 
-Three decisions keep it fast enough to run on a hover:
+The preview is six runs of twelve frames rather than one continuous stretch:
+six seconds of playback showing six different moments. One continuous second
+tells you about one moment, and on a static shot it is indistinguishable from
+the thumbnail. Measured on ten of the machine's own videos, consecutive frames
+in a single run differed by 5.8 on a 0 to 255 scale, while the openings of the
+six runs differed by 58.
+
+Where those runs come from matters as much as how many there are. Sampling is
+trimmed to between 12% and 90% of the duration, which drops title cards and
+credits, and a power curve bunches the samples toward the middle, where
+whatever the video is about tends to be. A clip barely longer than the preview
+is played straight through instead of having six holes cut in it.
+
+Four decisions keep it fast enough to run on a hover:
 
 * **The decoder scales, not Python.** The source reader is asked for a small
   RGB32 output instead of the native size. Letting Media Foundation scale during
   conversion took a 1920x1080 decode from 1819 ms to 114 ms. The requested size
   keeps the source aspect ratio, since a fixed size makes the reader stretch.
-* **One seek, then read forward.** Seeking to each frame in turn costs a fresh
-  run from the preceding keyframe every time. Seeking once to 15% of the
-  duration and reading consecutively is far cheaper. Running forward to that
-  exact time is bounded, because on a long group of pictures it consumed the
-  whole read budget and returned nothing.
-* **Stale work is dropped, not decoded.** A clip costs about a second, so
-  sweeping down a list of videos would queue one decode per row. The worker
-  compares each job's token against the current selection and skips it.
+* **One seek per run, then read forward.** Seeking to each frame in turn costs a
+  fresh run from the preceding keyframe every time, so each run is one seek
+  followed by consecutive reads. Running forward to the exact requested time is
+  bounded, because on a long group of pictures it consumed the whole read
+  budget and returned nothing.
+* **Runs are handed over as they finish.** The preview starts playing after the
+  first run, about 700 ms in, and lengthens as the rest arrive. Nobody waits
+  for the full decode.
+* **Stale work is abandoned, not decoded.** A full preview costs a few seconds,
+  so sweeping down a list of videos would queue one decode per row. The worker
+  skips jobs whose selection has already moved on, and a decode in progress
+  stops at the next run boundary when the selection changes.
 
 Opening frames that are a flat colour are passed over, so a video that starts on
-a black card does not preview as a black rectangle. Decoding stops after 1.5
+a black card does not preview as a black rectangle. Decoding stops after six
 seconds and animates whatever arrived, and a file Media Foundation cannot open
 simply keeps its still thumbnail.
 
-Across a 50 video sample on the development machine, decoding took a median of
-703 ms and at worst 1557 ms, all of it on the worker thread with the still
-thumbnail already on screen.
+Across a 24 video sample on the development machine, motion appeared after a
+median of 688 ms, the full six run preview took a median of 3.4 seconds, and
+all of it runs on the worker thread with the still thumbnail already on screen.
+A complete preview holds 72 frames, about 25 MB inside Tk, released as soon as
+the selection moves.
 
 ### How search stays fast
 
@@ -426,7 +445,7 @@ hold on any machine.
 ## Development
 
 ```sh
-python -m unittest discover -s tests     # 370 tests
+python -m unittest discover -s tests     # 388 tests
 python quickfind.py --bench report       # time a query
 python quickfind.py --selftest-mft       # verify MFT enumeration (needs admin)
 ```

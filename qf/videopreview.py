@@ -38,9 +38,23 @@ ENDOFSTREAM = 0x00000002
 VIDEO_EXTENSIONS = frozenset(
     ".mp4 .m4v .mkv .mov .avi .wmv .webm .mpg .mpeg .ts .m2ts .flv .3gp".split())
 
-# Defaults: about three seconds at a readable rate, small enough to decode fast.
-DEFAULT_FRAMES = 24
-DEFAULT_FPS = 8.0
+# A preview is several short runs from across the clip rather than one long
+# one: one continuous second tells you about one moment, six spread through
+# the film tell you what it is. Defaults are 6 runs of 9 frames at 12fps,
+# about 4.5 seconds of playback.
+DEFAULT_SEGMENTS = 6
+DEFAULT_PER_SEGMENT = 12
+DEFAULT_FPS = 12.0
+# A clip barely longer than the preview is better shown straight through than
+# chopped into runs with gaps between them.
+SHORT_CLIP_FACTOR = 1.5
+DEFAULT_FRAMES = 24        # when a caller wants one run instead
+# Where to sample from. Trimming both ends drops title cards and credits, and
+# the bias bunches samples toward the middle.
+FIRST_FRACTION = 0.12
+LAST_FRACTION = 0.90
+CENTRE_BIAS = 1.2
+MIN_SEEKABLE_SECONDS = 1.0
 START_FRACTION = 0.15      # skip title cards and black leader
 MAX_READS_PER_FRAME = 40
 # How many decoded frames may be thrown away while running from the keyframe
@@ -50,8 +64,9 @@ MAX_CATCH_UP_READS = 60
 MAX_BLANK_SKIPS = 8
 BLANK_RANGE = 10           # a frame this flat carries no information
 # A 4K clip decodes far slower than a 720p one. Rather than stall the
-# preview worker, stop early and animate however many frames arrived.
-DEFAULT_BUDGET_SECONDS = 1.5
+# preview worker, stop early and animate however many frames arrived. Runs are
+# handed over as they finish, so a preview is already playing well before this.
+DEFAULT_BUDGET_SECONDS = 6.0
 
 
 class GUID(ctypes.Structure):
@@ -148,13 +163,52 @@ def _bgra_to_png(raw: bytes, width: int, height: int, flip: bool) -> bytes:
     return encode_png(width, height, bytes(pixels))
 
 
+def positions(duration, count, first=FIRST_FRACTION, last=LAST_FRACTION,
+              bias=CENTRE_BIAS):
+    """Where in the clip to sample, in seconds, weighted toward the middle.
+
+    Title cards, logos and credits are the least informative part of a video,
+    so the range is trimmed at both ends. The power curve then bunches the
+    samples toward the middle, where whatever the video is actually about
+    tends to be.
+    """
+    if count < 1:
+        return []
+    if not duration or duration <= 0:
+        return [0.0] * count
+    if count == 1:
+        return [duration * first]
+    out = []
+    for i in range(count):
+        x = i / (count - 1)
+        sign = 1.0 if x >= 0.5 else -1.0
+        curved = 0.5 + 0.5 * sign * abs(2.0 * x - 1.0) ** bias
+        out.append(duration * (first + curved * (last - first)))
+    return out
+
+
 def frames(path, size=(240, 135), count=DEFAULT_FRAMES, fps=DEFAULT_FPS,
            start_fraction=START_FRACTION, flip=True,
            budget_seconds=DEFAULT_BUDGET_SECONDS):
-    """Decode a short run of frames as PNG bytes.
+    """One run of consecutive frames from a single point in the clip."""
+    width, height, runs = segments(
+        path, size=size, count=1, per_segment=count, fps=fps,
+        first=start_fraction, budget_seconds=budget_seconds)
+    return width, height, (runs[0] if runs else [])
 
-    Returns ``(width, height, [png, ...])``, empty when the file cannot be
-    decoded. Safe to call only off the UI thread: it reads and decodes.
+
+def segments(path, size=(240, 135), count=DEFAULT_SEGMENTS,
+             per_segment=DEFAULT_PER_SEGMENT, fps=DEFAULT_FPS,
+             first=FIRST_FRACTION, last=LAST_FRACTION,
+             budget_seconds=DEFAULT_BUDGET_SECONDS, on_segment=None):
+    """Decode short runs from several points in the clip.
+
+    Returns ``(width, height, [[png, ...], ...])``, one list per point
+    sampled, and empty when the file cannot be decoded. ``on_segment`` is
+    called with ``(width, height, pngs)`` as each run finishes, so a caller
+    can start showing motion before the rest arrives; returning False from it
+    stops the decode. Safe to call only off the UI thread: it reads and
+    decodes.
     """
     initialised = ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
     if mfplat.MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET) != 0:
@@ -163,7 +217,8 @@ def frames(path, size=(240, 135), count=DEFAULT_FRAMES, fps=DEFAULT_FPS,
         return 0, 0, []
 
     reader = ctypes.c_void_p()
-    out = []
+    runs = []
+    flip = True
     width = height = 0
     try:
         attributes = ctypes.c_void_p()
@@ -251,74 +306,97 @@ def frames(path, size=(240, 135), count=DEFAULT_FRAMES, fps=DEFAULT_FPS,
                        ctypes.POINTER(ctypes.c_longlong),
                        ctypes.POINTER(ctypes.c_void_p))
 
-        # One seek, then read forward. The reader resumes at the keyframe
-        # before the requested time, so frames arrive early and are skipped.
-        begin = 0.0
-        if duration and duration > 1.0:
-            begin = duration * start_fraction
-            pos = PROPVARIANT()
-            pos.vt = VT_I8
-            pos.value = int(begin * 10_000_000)
-            _method(reader, SR_SET_CURRENT_POSITION, ctypes.c_long,
-                    ctypes.POINTER(GUID), ctypes.POINTER(PROPVARIANT))(
-                reader, ctypes.byref(GUID_NULL), ctypes.byref(pos))
-
-        interval = 1.0 / fps if fps > 0 else 0.0
-        next_wanted = begin
-        # The reader resumes at the keyframe before the requested time, so the
-        # first frames arrive early and get skipped. Skipping is bounded: on a
-        # long-GOP file, insisting on reaching the requested time burned the
-        # whole read budget and returned nothing at all. Past the bound, the
-        # next frame is taken wherever it lands.
-        catch_up = MAX_CATCH_UP_READS
-        blanks_left = MAX_BLANK_SKIPS
-        reads = 0
-        budget = count * MAX_READS_PER_FRAME
-        # A file that yields nothing must give up too, or it ties up the
-        # worker that every other preview shares.
+        # Without a duration there is nowhere to seek to, so take one run from
+        # wherever the file starts.
+        if not duration or duration <= MIN_SEEKABLE_SECONDS:
+            starts = [None]
+        elif duration < (count * per_segment / fps) * SHORT_CLIP_FACTOR:
+            # Barely longer than the preview itself: play it through instead of
+            # cutting six one second holes in it.
+            starts = [duration * first]
+            per_segment *= count
+        else:
+            starts = positions(duration, count, first, last)
         deadline = time.monotonic() + budget_seconds
-        while len(out) < count and reads < budget:
+        for start in starts:
+            pngs = _run(reader, read, start, per_segment, fps,
+                        width, height, flip, deadline)
+            if not pngs:
+                break
+            runs.append(pngs)
+            if on_segment is not None and on_segment(width, height, pngs) is False:
+                break
             if time.monotonic() > deadline:
                 break
-            sample = ctypes.c_void_p()
-            flags = ctypes.c_ulong()
-            stream = ctypes.c_ulong()
-            stamp = ctypes.c_longlong()
-            hr = read(reader, FIRST_VIDEO_STREAM, 0, ctypes.byref(stream),
-                      ctypes.byref(flags), ctypes.byref(stamp),
-                      ctypes.byref(sample))
-            reads += 1
-            if hr != 0 or (flags.value & ENDOFSTREAM):
-                break
-            if not sample:
-                continue
-            try:
-                seconds = stamp.value / 10_000_000.0
-                if seconds + 1e-6 < next_wanted and catch_up > 0:
-                    catch_up -= 1
-                    continue
-                raw = _sample_bytes(sample)
-                if raw is None:
-                    continue
-                # Plenty of clips open on a black or white card. Starting the
-                # preview there tells the viewer nothing, so a few of them are
-                # passed over before giving up and showing what is there.
-                if not out and blanks_left and _is_blank(raw):
-                    blanks_left -= 1
-                    next_wanted = seconds + interval
-                    continue
-                next_wanted = seconds + interval
-                out.append(_bgra_to_png(raw, width, height, flip))
-            finally:
-                _release(sample)
     except Exception:
-        return width, height, out
+        return width, height, runs
     finally:
         _release(reader)
         mfplat.MFShutdown()
         if initialised in (0, 1):
             ole32.CoUninitialize()
-    return width, height, out
+    return width, height, runs
+
+
+def _run(reader, read, start, count, fps, width, height, flip, deadline):
+    """Consecutive frames from ``start`` seconds, or from here if it is None."""
+    if start is not None:
+        position = PROPVARIANT()
+        position.vt = VT_I8
+        position.value = int(max(0.0, start) * 10_000_000)
+        _method(reader, SR_SET_CURRENT_POSITION, ctypes.c_long,
+                ctypes.POINTER(GUID), ctypes.POINTER(PROPVARIANT))(
+            reader, ctypes.byref(GUID_NULL), ctypes.byref(position))
+
+    interval = 1.0 / fps if fps > 0 else 0.0
+    next_wanted = start or 0.0
+    # The reader resumes at the keyframe before the requested time, so the
+    # first frames arrive early and get skipped. Skipping is bounded: on a
+    # long-GOP file, insisting on reaching the requested time burned the whole
+    # read budget and returned nothing at all. Past the bound, the next frame
+    # is taken wherever it lands.
+    catch_up = MAX_CATCH_UP_READS
+    blanks_left = MAX_BLANK_SKIPS
+    reads = 0
+    budget = count * MAX_READS_PER_FRAME
+    out = []
+    while len(out) < count and reads < budget:
+        # A file that yields nothing must give up too, or it ties up the
+        # worker that every other preview shares.
+        if time.monotonic() > deadline:
+            break
+        sample = ctypes.c_void_p()
+        flags = ctypes.c_ulong()
+        stream = ctypes.c_ulong()
+        stamp = ctypes.c_longlong()
+        hr = read(reader, FIRST_VIDEO_STREAM, 0, ctypes.byref(stream),
+                  ctypes.byref(flags), ctypes.byref(stamp),
+                  ctypes.byref(sample))
+        reads += 1
+        if hr != 0 or (flags.value & ENDOFSTREAM):
+            break
+        if not sample:
+            continue
+        try:
+            seconds = stamp.value / 10_000_000.0
+            if seconds + 1e-6 < next_wanted and catch_up > 0:
+                catch_up -= 1
+                continue
+            raw = _sample_bytes(sample)
+            if raw is None:
+                continue
+            # Plenty of clips open on a black or white card, and a scene
+            # change can land on one too. Opening a run there tells the viewer
+            # nothing, so a few are passed over before taking what is there.
+            if not out and blanks_left and _is_blank(raw):
+                blanks_left -= 1
+                next_wanted = seconds + interval
+                continue
+            next_wanted = seconds + interval
+            out.append(_bgra_to_png(raw, width, height, flip))
+        finally:
+            _release(sample)
+    return out
 
 
 def _default_stride(media_type):

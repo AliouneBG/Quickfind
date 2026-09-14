@@ -109,6 +109,49 @@ class TestPixelConversion(unittest.TestCase):
         videopreview._bgra_to_png(bytes(4), 4, 4, flip=True)
 
 
+class TestSamplePositions(unittest.TestCase):
+    """Where in a clip the runs come from."""
+
+    def test_one_position_per_run(self):
+        self.assertEqual(len(videopreview.positions(100.0, 6)), 6)
+
+    def test_nothing_is_taken_from_the_title_card_or_the_credits(self):
+        marks = videopreview.positions(100.0, 6)
+        self.assertGreaterEqual(min(marks), 100.0 * videopreview.FIRST_FRACTION)
+        self.assertLessEqual(max(marks), 100.0 * videopreview.LAST_FRACTION)
+
+    def test_the_ends_of_the_range_are_used(self):
+        marks = videopreview.positions(100.0, 6)
+        self.assertAlmostEqual(marks[0], 12.0, places=3)
+        self.assertAlmostEqual(marks[-1], 90.0, places=3)
+
+    def test_positions_move_forward(self):
+        marks = videopreview.positions(600.0, 8)
+        self.assertEqual(marks, sorted(marks))
+
+    def test_samples_bunch_toward_the_middle(self):
+        # The point of the bias: more of the preview comes from the middle of
+        # the video than from either end.
+        marks = videopreview.positions(100.0, 7)
+        gaps = [b - a for a, b in zip(marks, marks[1:])]
+        self.assertLess(gaps[len(gaps) // 2], gaps[0])
+        self.assertLess(gaps[len(gaps) // 2], gaps[-1])
+
+    def test_the_middle_sample_sits_in_the_middle(self):
+        marks = videopreview.positions(100.0, 5)
+        self.assertAlmostEqual(marks[2], 51.0, places=3)
+
+    def test_a_single_run_starts_early_rather_than_centrally(self):
+        self.assertAlmostEqual(videopreview.positions(100.0, 1)[0], 12.0,
+                               places=3)
+
+    def test_an_unknown_duration_yields_no_offsets(self):
+        self.assertEqual(videopreview.positions(0, 3), [0.0, 0.0, 0.0])
+
+    def test_asking_for_none_gives_none(self):
+        self.assertEqual(videopreview.positions(100.0, 0), [])
+
+
 class TestBlankFrames(unittest.TestCase):
     """Opening on a black card would defeat the point of the preview."""
 
@@ -181,6 +224,46 @@ class TestDecoding(unittest.TestCase):
                                            count=200, fps=30,
                                            budget_seconds=0.01)
         self.assertLess(len(pngs), 200)
+
+    def test_several_runs_come_back(self):
+        _w, _h, runs = videopreview.segments(self.clips[0], size=(160, 160),
+                                             count=4, per_segment=4)
+        self.assertGreaterEqual(len(runs), 2)
+        self.assertTrue(all(runs), "no run should be empty")
+
+    def test_runs_show_different_parts_of_the_clip(self):
+        _w, _h, runs = videopreview.segments(self.clips[0], size=(160, 160),
+                                             count=4, per_segment=3)
+        openers = [run[0] for run in runs]
+        self.assertEqual(len(set(openers)), len(openers),
+                         "two runs opened on the same frame")
+
+    def test_each_run_is_offered_as_it_finishes(self):
+        handed = []
+        _w, _h, runs = videopreview.segments(
+            self.clips[0], size=(160, 160), count=3, per_segment=3,
+            on_segment=lambda w, h, pngs: handed.append(pngs))
+        self.assertEqual(len(handed), len(runs))
+
+    def test_saying_no_stops_the_decode(self):
+        handed = []
+
+        def once(width, height, pngs):
+            handed.append(pngs)
+            return False
+
+        _w, _h, runs = videopreview.segments(self.clips[0], size=(160, 160),
+                                             count=5, per_segment=3,
+                                             on_segment=once)
+        self.assertEqual(len(handed), 1)
+        self.assertEqual(len(runs), 1)
+
+    def test_a_short_clip_is_played_straight_through(self):
+        # Six one second runs would cut holes in a clip only a few seconds
+        # long, so it is taken in one piece instead.
+        _w, _h, runs = videopreview.segments(self.clips[0], size=(120, 120),
+                                             count=6, per_segment=12, fps=1.0)
+        self.assertEqual(len(runs), 1)
 
     def test_missing_file_returns_nothing(self):
         self.assertEqual(videopreview.frames(r"C:\nope\missing.mp4")[2], [])
@@ -336,13 +419,24 @@ class TestPlayback(unittest.TestCase):
         worker.join(10)
         self.assertFalse(worker.is_alive(), "worker did not finish")
 
+    def fake_decoder(self, decoded, runs=1):
+        """Stand in for the real decoder, recording what it was asked for."""
+        def decode(path, size=None, count=1, per_segment=1, fps=12.0,
+                   on_segment=None, **rest):
+            decoded.append(path)
+            for _ in range(runs):
+                if on_segment is not None:
+                    if on_segment(2, 2, self.frames) is False:
+                        break
+            return 2, 2, []
+        return decode
+
     def test_a_stale_video_job_is_never_decoded(self):
-        # Sweeping down a list of clips must not queue a second of decoding
+        # Sweeping down a list of clips must not queue seconds of decoding
         # for every row it passes.
         decoded = []
-        with mock.patch.object(ui.videopreview, "frames",
-                               side_effect=lambda *a, **k: decoded.append(a[0])
-                               or (0, 0, [])):
+        with mock.patch.object(ui.videopreview, "segments",
+                               side_effect=self.fake_decoder(decoded)):
             self.app._preview_token = 9
             self.app._jobs.put(("video", 8, r"C:\v\old.mp4", (100, 100)))
             self.run_worker()
@@ -350,13 +444,53 @@ class TestPlayback(unittest.TestCase):
 
     def test_the_current_video_job_is_decoded(self):
         decoded = []
-        with mock.patch.object(ui.videopreview, "frames",
-                               side_effect=lambda *a, **k: decoded.append(a[0])
-                               or (0, 0, [])):
+        with mock.patch.object(ui.videopreview, "segments",
+                               side_effect=self.fake_decoder(decoded)):
             self.app._preview_token = 9
             self.app._jobs.put(("video", 9, r"C:\v\clip.mp4", (100, 100)))
             self.run_worker()
         self.assertEqual(decoded, [r"C:\v\clip.mp4"])
+
+    def test_each_run_is_handed_over_as_it_lands(self):
+        with mock.patch.object(ui.videopreview, "segments",
+                               side_effect=self.fake_decoder([], runs=3)):
+            self.app._preview_token = 9
+            self.app._jobs.put(("video", 9, r"C:\v\clip.mp4", (100, 100)))
+            self.run_worker()
+        delivered = [item for item in list(self.app._done.queue)
+                     if item[0] == "video"]
+        self.assertEqual(len(delivered), 3, "runs should arrive one at a time")
+
+    def test_a_decode_is_abandoned_when_the_selection_moves(self):
+        def decode(path, size=None, count=1, per_segment=1, fps=12.0,
+                   on_segment=None, **rest):
+            # The first run lands, then the user moves to another row.
+            on_segment(2, 2, self.frames)
+            self.app._preview_token += 1
+            self.kept_going = on_segment(2, 2, self.frames) is not False
+            return 2, 2, []
+
+        self.kept_going = None
+        with mock.patch.object(ui.videopreview, "segments", side_effect=decode):
+            self.app._preview_token = 9
+            self.app._jobs.put(("video", 9, r"C:\v\clip.mp4", (100, 100)))
+            self.run_worker()
+        self.assertFalse(self.kept_going, "the decoder was told to carry on")
+
+    def test_a_later_run_lengthens_the_loop(self):
+        self.app.show()
+        self.app._start_video(self.frames)
+        first = self.app._video_id
+        self.app._extend_video(self.frames)
+        self.assertEqual(len(self.app._video_frames), len(self.frames) * 2)
+        self.assertEqual(self.app._video_id, first,
+                         "playback should not restart when a run is added")
+
+    def test_the_first_run_starts_playback(self):
+        self.app.show()
+        self.assertIsNone(self.app._video_id)
+        self.app._extend_video(self.frames)
+        self.assertIsNotNone(self.app._video_id)
 
     def test_shutdown_stops_playback(self):
         self.app.show()
