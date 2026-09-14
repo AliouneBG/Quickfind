@@ -13,7 +13,8 @@ library, so there is nothing to install, no virtualenv, and no build step.
 * Abbreviation matching, so `qckfnd` finds `quickfind`.
 * Ranking that prefers apps, your own files, and things you have opened before.
 * Windows shell icons on every row, and a word for what each result is.
-* Preview pane with thumbnails for images and video, and text excerpts for code.
+* Preview pane with thumbnails for images and video, rendered first pages for
+  PDFs, and text excerpts for code.
 * Videos play a silent preview at 20fps, sampled from across the clip.
 * New downloads and saved files are findable within a second, no admin needed.
 * Live index updates through the NTFS change journal when running as admin.
@@ -243,6 +244,7 @@ on-disk cache is 53 MB.
 | `qf/ui.py` | Tk overlay, DPI scaling, the virtual list, preview pane |
 | `qf/shellicon.py` | Shell icons and thumbnails, encoded to PNG for Tk |
 | `qf/videopreview.py` | Silent video frames decoded with Media Foundation |
+| `qf/pdfpreview.py` | First page of a PDF, rendered with Windows.Data.Pdf |
 | `qf/freshwatch.py` | Watches the folders files land in, no privileges needed |
 | `qf/usage.py` | Frecency store of what you opened and how recently |
 | `qf/hotkey.py` | `RegisterHotKey` on its own message loop |
@@ -352,6 +354,35 @@ on the standard library.
 When the shell has no real thumbnail it offers a generic page glyph. Requesting
 `SIIGBF_THUMBNAILONLY` first tells the two apart, so a source file shows its
 code rather than a blank page.
+
+### PDF pages
+
+Explorer shows a page thumbnail for a PDF only if something registered a
+thumbnail handler, which on a machine without Acrobat is nothing: the shell
+returns empty and the pane falls back to a generic icon. All 25 PDFs sampled
+here came back that way.
+
+So the page is rendered instead, with `Windows.Data.Pdf`, the renderer Edge
+itself uses and which ships with every Windows 10 and 11. It is WinRT rather
+than COM, so `qf/pdfpreview.py` goes through activation factories, finds
+methods by vtable slot, and waits on asynchronous calls by polling their
+status: a completion handler would mean building a COM object with a vtable
+out of ctypes, and a render takes about a tenth of a second.
+
+All 25 render, in a median of 89 ms and 147 ms at p90, on the worker thread
+like every other preview. The page count goes into the details line, since the
+picture is page one of however many.
+
+Two things worth knowing if you touch it:
+
+* `GetFileFromPathAsync` rejects a relative path, and the refusal arrives as a
+  failed asynchronous operation rather than a bad argument, which is a
+  confusing way to learn it.
+* `DestinationWidth` is not the width you get back. It came back at exactly
+  twice the request on the development machine, so the first page rendered in
+  a session measures the ratio and any later one is asked for a corrected
+  width. Assuming a ratio would crop the pane wherever the assumption was
+  wrong.
 
 ### Files that arrive after the index is built
 

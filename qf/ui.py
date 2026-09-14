@@ -12,7 +12,7 @@ import tkinter.font as tkfont
 from ctypes import wintypes
 from tkinter import ttk
 
-from . import kinds, shellicon, videopreview
+from . import kinds, pdfpreview, shellicon, videopreview
 from .usage import OPEN_WEIGHT, REVEAL_WEIGHT
 
 BG = "#1b1c22"
@@ -47,6 +47,11 @@ DEEPEN_MS = 120
 PREVIEW_WIDTH = 250
 PREVIEW_DELAY_MS = 180
 PREVIEW_THUMB = 132
+# A rendered page is portrait, so height is what runs out rather than width.
+# The pane is a fixed 250 logical px tall and the name and details live under
+# the picture: measured, 160 is the tallest page that still leaves room for
+# them, even when a long filename wraps onto two lines.
+PREVIEW_PAGE = 150
 ICON_PUMP_MS = 50
 # A short silent clip, decoded on the worker and cycled as images.
 # Six runs of eighteen frames, sampled across the clip: five and a half seconds
@@ -243,7 +248,7 @@ def read_excerpt(path: str) -> str:
 
 
 def describe(path: str, is_dir: bool, type_name: str,
-             cloud_only: bool = False) -> str:
+             cloud_only: bool = False, pages: int = 0) -> str:
     try:
         info = os.stat(path)
     except OSError:
@@ -254,6 +259,10 @@ def describe(path: str, is_dir: bool, type_name: str,
     # Say so rather than showing an empty pane and leaving the viewer to
     # wonder why this one file previews as nothing.
     tail = "\nOnline only, not downloaded" if cloud_only else ""
+    # The page shown is the first of however many, which is worth knowing
+    # when the preview is a single page of a long document.
+    if pages:
+        tail = f"\n{pages} page{'s' if pages != 1 else ''}" + tail
     return (f"{type_name or 'File'}\n{human_size(info.st_size)}\n{when}"
             f"{tail}")
 
@@ -738,16 +747,24 @@ class Launcher:
         if not is_dir:
             image = shellicon.thumbnail_png(path, self.px(PREVIEW_THUMB),
                                             thumbnail_only=True)
+        cloud_only = (not is_dir) and is_cloud_only(path)
+        pages = 0
+        if image is None and not cloud_only and pdfpreview.is_pdf(path):
+            # Nothing has registered a PDF thumbnail handler on a machine
+            # without Acrobat, so the shell returns nothing and the page is
+            # rendered here instead.
+            image, pages = pdfpreview.first_page(
+                path, box=(self.preview_width - self.px(16),
+                           self.px(PREVIEW_PAGE)))
         is_thumbnail = image is not None
         icon, type_name = self._icons.png_for(path, is_dir, True)
         if image is None:
             image = icon
-        cloud_only = (not is_dir) and is_cloud_only(path)
         return {
             "path": path,
             "image": image,
             "is_thumbnail": is_thumbnail,
-            "meta": describe(path, is_dir, type_name, cloud_only),
+            "meta": describe(path, is_dir, type_name, cloud_only, pages),
             "excerpt": "" if is_dir else read_excerpt(path),
             # Decoding a placeholder would pull the whole file down over the
             # network, so a cloud-only video keeps its still thumbnail.
