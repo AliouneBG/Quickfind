@@ -330,7 +330,9 @@ class TestRowFitting(unittest.TestCase):
     def test_elided_path_keeps_the_tail(self):
         deep = "C:\\a\\" + "\\".join(f"seg{n}" for n in range(30)) + "\\finalfolder"
         row = self.app._format_row(StubResult("x.txt", deep + "\\x.txt"))
-        self.assertTrue(row.rstrip().endswith("finalfolder"))
+        # The folder now runs into the kind column rather than the row's end.
+        self.assertIn("finalfolder", row)
+        self.assertTrue(row.rstrip().endswith("Text"), row[-20:])
 
     def test_long_name_is_elided_from_the_right(self):
         name = "extremely" + "long" * 30 + "name.txt"

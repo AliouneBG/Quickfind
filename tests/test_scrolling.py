@@ -297,6 +297,42 @@ class TestViewport(unittest.TestCase):
         app._deepen()
         self.assertIn("2000 matches", app.status.cget("text"))
 
+    # -- saying what each row is -------------------------------------------
+
+    def test_a_row_says_what_it_is(self):
+        rows = [Row("PotPlayerMini64.exe", r"C:\Program Files\DAUM\PotPlayer.exe"),
+                Row("PotPlayerSetup64.exe", r"C:\Users\me\Downloads\Setup.exe"),
+                Row("holiday.mp4", r"C:\Users\me\Videos\holiday.mp4")]
+        app = self.launcher(rows)
+        shown = self.shown(app)
+        self.assertTrue(shown[0].rstrip().endswith("App"), shown[0])
+        self.assertTrue(shown[1].rstrip().endswith("Installer"), shown[1])
+        self.assertTrue(shown[2].rstrip().endswith("Video"), shown[2])
+
+    def test_folders_are_labelled_too(self):
+        app = self.launcher([Row("Downloads", r"C:\Users\me\Downloads",
+                                 is_dir=True)])
+        self.assertTrue(self.shown(app)[0].rstrip().endswith("Folder"))
+
+    def test_the_kind_column_does_not_shift_while_scrolling(self):
+        app = self.launcher(self.rows(400))
+        before = app._kind_px
+        app._scroll_to(300)
+        self.assertEqual(app._kind_px, before)
+
+    def test_the_label_stays_inside_the_row(self):
+        rows = [Row("a-really-quite-long-file-name-for-a-video.mp4",
+                    "C:\\" + "\\".join("folder%02d" % n for n in range(12))
+                    + "\\a-really-quite-long-file-name-for-a-video.mp4")]
+        app = self.launcher(rows)
+        row = self.shown(app)[0]
+        self.assertTrue(row.rstrip().endswith("Video"))
+        self.assertLessEqual(app._text_px(row.rstrip()), app._row_budget())
+
+    def test_an_unknown_kind_leaves_the_column_empty(self):
+        app = self.launcher([Row("thing.dpl", r"C:\x\thing.dpl")])
+        self.assertNotIn("Unknown", self.shown(app)[0])
+
     # -- inviting a scroll only when there is one to make -------------------
 
     def test_a_long_list_invites_scrolling(self):

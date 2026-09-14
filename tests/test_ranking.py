@@ -183,3 +183,51 @@ class TestNoRegressions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestInstallersAndLaunchers(unittest.TestCase):
+    """Searching for a program should not lead with the thing that installed it.
+
+    Typing a media player's name returned its installer, its logo and its
+    playlist above the program itself, and the rows all looked alike.
+    """
+
+    PATHS = [
+        r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe",
+        r"C:\Users\me\Downloads\PotPlayerSetup64.exe",
+        r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\PotPlayer\PotPlayer 64 bit.lnk",
+    ]
+
+    def test_the_installer_is_not_the_first_answer(self):
+        order = ranked(searcher_for(self.PATHS), "potplayer")
+        self.assertNotIn("Setup", order[0])
+
+    def test_the_installer_still_ranks(self):
+        # Demoted, not hidden: it is a real file that really matched.
+        order = ranked(searcher_for(self.PATHS), "potplayer")
+        self.assertIn(r"C:\Users\me\Downloads\PotPlayerSetup64.exe", order)
+
+    def test_asking_for_the_installer_finds_it_first(self):
+        order = ranked(searcher_for(self.PATHS), "potplayer setup")
+        self.assertEqual(order[0],
+                         r"C:\Users\me\Downloads\PotPlayerSetup64.exe")
+
+    def test_the_start_menu_entry_beats_a_copy_elsewhere(self):
+        paths = [
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Thing\Thing.lnk",
+            r"C:\Users\me\Documents\backups\Thing.lnk",
+        ]
+        order = ranked(searcher_for(paths), "thing")
+        self.assertIn("Start Menu", order[0])
+
+    def test_an_uninstaller_is_not_promoted_by_being_in_the_start_menu(self):
+        paths = [
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Thing\Uninstall Thing.lnk",
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Thing\Thing.lnk",
+        ]
+        order = ranked(searcher_for(paths), "thing")
+        self.assertNotIn("Uninstall", order[0])
+
+    def test_a_folder_named_setup_is_not_an_installer(self):
+        s = searcher_for([r"C:\Users\me\projects\setup\notes.txt"])
+        self.assertTrue(ranked(s, "setup"))

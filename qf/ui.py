@@ -12,7 +12,7 @@ import tkinter.font as tkfont
 from ctypes import wintypes
 from tkinter import ttk
 
-from . import shellicon, videopreview
+from . import kinds, shellicon, videopreview
 from .usage import OPEN_WEIGHT, REVEAL_WEIGHT
 
 BG = "#1b1c22"
@@ -272,6 +272,7 @@ class Launcher:
         self._top = 0
         self._cursor = -1
         self._column_px = 0
+        self._kind_px = 0
         # The status line for the current search, and whether it is currently
         # carrying the invitation to scroll.
         self._note = None
@@ -619,27 +620,32 @@ class Launcher:
         """Width left for row text once the icon and padding take their share."""
         return self.px(self.list_width) - self.px(64)
 
-    def _column_for(self, results) -> int:
-        """The shared folder column for a whole result set.
+    def _columns_for(self, results):
+        """The folder and kind columns for a whole result set.
 
         Measured once per search over at most a few hundred rows. Recomputing
-        it from whatever is in view would make the folders shuffle sideways
+        them from whatever is in view would make the columns shuffle sideways
         every time the list scrolled.
         """
+        sample = results[:COLUMN_SAMPLE_ROWS]
         available = self._row_budget()
         cap = int(available * 0.45)
         leads = [self._elide(r.name, cap - self.px(12), keep_tail=False)
-                 for r in results[:COLUMN_SAMPLE_ROWS]]
-        return min(cap, max((self._text_px(lead) for lead in leads), default=0)
-                   + self._text_px("    "))
+                 for r in sample]
+        folder = min(cap, max((self._text_px(lead) for lead in leads), default=0)
+                     + self._text_px("    "))
+        labels = {kinds.kind_of(r.name, r.is_dir) for r in sample}
+        widest = max((self._text_px(label) for label in labels), default=0)
+        return folder, (widest + self._text_px("  ") if widest else 0)
 
-    def _format_rows(self, results, column=None) -> list[str]:
-        """Name on the left, folders aligned to a shared column.
+    def _format_rows(self, results, column=None, kind_column=None) -> list[str]:
+        """Name, then folder, then what the thing actually is.
 
-        A tree row is one string, so the gap is padded with spaces measured
-        against the real font. The column is only as wide as the longest name
-        actually present, capped at 45% -- a fixed column would strand short
-        names beside a wall of space and leave paths nothing to elide into.
+        A tree row is one string, so the columns are padded with spaces
+        measured against the real font. The name column is only as wide as the
+        longest name actually present, capped at 45% -- a fixed column would
+        strand short names beside a wall of space and leave paths nothing to
+        elide into.
         """
         available = self._row_budget()
         cap = int(available * 0.45)
@@ -647,23 +653,29 @@ class Launcher:
 
         leads = []
         for result in results:
-            # No "[dir]" marker any more: the shell icon says what it is.
+            # No "[dir]" marker any more: the icon and the kind both say so.
             leads.append(self._elide(result.name, cap - self.px(12),
                                      keep_tail=False))
+        labels = [kinds.kind_of(r.name, r.is_dir) for r in results]
 
-        if column is None:
-            column = min(cap, max((measure(lead) for lead in leads), default=0)
-                         + measure("    "))
+        if column is None or kind_column is None:
+            column, kind_column = self._columns_for(results)
         space_px = max(1, measure(" "))
+        kind_at = available - kind_column
 
         rows = []
-        for lead, result in zip(leads, results):
+        for lead, result, label in zip(leads, results, labels):
             lead_px = measure(lead)
             pad = max(2, (column - lead_px) // space_px + 1)
             folder = os.path.dirname(result.path) or result.path
-            remaining = available - lead_px - pad * space_px
-            rows.append(lead + " " * pad + self._elide(folder, remaining,
-                                                       keep_tail=True))
+            used = lead_px + pad * space_px
+            folder = self._elide(folder, kind_at - used - space_px,
+                                 keep_tail=True)
+            row = lead + " " * pad + folder
+            if label:
+                tail = max(1, (kind_at - used - measure(folder)) // space_px)
+                row += " " * tail + label
+            rows.append(row)
         return rows
 
     def _format_row(self, result) -> str:
@@ -1149,7 +1161,7 @@ class Launcher:
         # One column width for the whole result set, measured once. Deriving
         # it from whatever happens to be on screen would make the folders
         # shuffle sideways as the list scrolled.
-        self._column_px = self._column_for(self.results)
+        self._column_px, self._kind_px = self._columns_for(self.results)
         # Back to the top. Leaving the view where the last search left it
         # showed an empty stretch of list and hid the match that had just been
         # selected.
@@ -1220,7 +1232,8 @@ class Launcher:
         count = self._visible_rows() if self.results else 0
         items = self._ensure_items(count)
         rows = self.results[self._top:self._top + count]
-        texts = self._format_rows(rows, column=self._column_px)
+        texts = self._format_rows(rows, column=self._column_px,
+                                  kind_column=self._kind_px)
         self._row_keys = []
         for item, result, text in zip(items, rows, texts):
             key = self._icons.key_for(result.path, result.is_dir)

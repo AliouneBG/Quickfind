@@ -12,7 +12,7 @@ library, so there is nothing to install, no virtualenv, and no build step.
 * Substring search on file and folder names, with multi-word path filtering.
 * Abbreviation matching, so `qckfnd` finds `quickfind`.
 * Ranking that prefers apps, your own files, and things you have opened before.
-* Windows shell icons on every row.
+* Windows shell icons on every row, and a word for what each result is.
 * Preview pane with thumbnails for images and video, and text excerpts for code.
 * Videos play a silent preview at 20fps, sampled from across the clip.
 * New downloads and saved files are findable within a second, no admin needed.
@@ -63,6 +63,11 @@ Undo that with `--uninstall-task`.
 Clicking away also dismisses it. The preview pane follows the selection, and a
 selected video shows its thumbnail for about half a second and then plays a
 silent preview.
+
+Each row ends with what the thing actually is: `App`, `Installer`, `Shortcut`,
+`Folder`, `Video`, `PDF` and so on. Searching for a media player turns up its
+folder, its logo, its installer, its uninstaller and the program itself, all
+with near-identical names, and the label is what separates them at a glance.
 
 The list holds far more than it shows. Only the rows on screen exist as
 widgets, so a search matching thousands of files scrolls as smoothly as one
@@ -234,6 +239,7 @@ on-disk cache is 53 MB.
 | `quickfind.py` | Entry point, config, elevation, and the Controller |
 | `qf/fsindex.py` | MFT enumeration, directory walk, packed storage, cache |
 | `qf/search.py` | Haystack scanning, ranking, abbreviation fallback |
+| `qf/kinds.py` | What a result is, in one word, for the list's last column |
 | `qf/ui.py` | Tk overlay, DPI scaling, the virtual list, preview pane |
 | `qf/shellicon.py` | Shell icons and thumbnails, encoded to PNG for Tk |
 | `qf/videopreview.py` | Silent video frames decoded with Media Foundation |
@@ -556,6 +562,14 @@ rules, in rough order of weight:
    between otherwise equal matches. This is most of what makes a launcher feel
    like it knows what you meant. One open lifted a file from rank 3 to rank 1
    among five identically scored siblings.
+8. **The program, not its installer.** An installer is what you ran once to
+   get the thing you are now looking for, and it usually sits in Downloads
+   where it collects the bonus for being your own file. It is demoted unless
+   the query asks for one, so `potplayer` leads with the player and
+   `potplayer setup` still leads with the installer.
+9. **The Start Menu is Windows' own list of installed programs**, so an entry
+   there is the canonical way to launch one and is promoted accordingly.
+   Uninstall entries are left where they are.
 
 `tests/evalset.py` measures this against real intent, asking questions like
 whether typing `cmd` puts `cmd.exe` first, so ranking changes can be compared

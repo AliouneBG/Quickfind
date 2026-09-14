@@ -35,6 +35,8 @@ import re
 import time
 from bisect import bisect_right
 
+from . import kinds
+
 MAX_SCAN_HITS = 12000
 MAX_PATH_PROBES = 6000
 # The most matches that will ever be turned into results. Resolving a path is
@@ -72,6 +74,16 @@ DEMOTED = (
     ("\\windows\\recent\\", 120.0),
     ("\\microsoft\\windows\\start menu\\programs\\startup\\", 60.0),
 )
+
+# The Start Menu is Windows' own list of installed programs, so an entry there
+# is the canonical way to launch one. Searching for a media player returned its
+# folder, its logo, its installer and its playlist above the program itself.
+START_MENU = "\\start menu\\programs\\"
+START_MENU_BONUS = 80.0
+# An installer is not the program: it is what you ran once to get it, and it
+# usually sits in Downloads, where it collects the bonus for being your own
+# file. Applied only when the query did not ask for one.
+INSTALLER_PENALTY = 90.0
 
 NUL = b"\x00"
 
@@ -304,6 +316,12 @@ class Searcher:
         for marker, penalty in DEMOTED:
             if marker in lowered_path:
                 score -= penalty
+        lowered_name = self.index.name(i).lower()
+        if START_MENU in lowered_path and "uninstall" not in lowered_name:
+            score += START_MENU_BONUS
+        if not self._wants_installer and kinds.kind_of(
+                lowered_name, bool(self.index.isdir[i])) == kinds.INSTALLER:
+            score -= INSTALLER_PENALTY
         # What you have actually opened, bounded so it reorders comparable
         # matches rather than promoting something irrelevant.
         if self.usage is not None:
@@ -339,6 +357,10 @@ class Searcher:
             return []
 
         self._now = time.time()
+        # Ask for an installer and you get installers; otherwise they are the
+        # thing standing between you and the program you meant.
+        self._wants_installer = any(word in query
+                                    for word in kinds.INSTALLER_WORDS)
         # Resolving a path is what a result costs, so only build as many as
         # were asked for. The floor keeps the interleaving in `_spread` a fair
         # fight even when the caller wants a handful.
