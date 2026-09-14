@@ -72,7 +72,8 @@ The status line reports how many files matched, not just how many fit on
 screen. Typing `resume` on a machine with hundreds of them reads `535 matches`
 and invites scrolling; when there are more than the list can hold it reads
 `2000 of 12,000+` and suggests adding a word, because a second word filters by
-folder and usually cuts the list to one.
+folder and usually cuts the list to one. The invitation to scroll is dropped
+once you reach the last row, since by then there is nothing more to scroll to.
 
 The tray icon has Show, Rebuild index, and Quit. On Windows 11 new tray icons
 start hidden behind the `^` chevron, so drag it out if you want it pinned.
@@ -553,7 +554,7 @@ hold on any machine.
 ## Development
 
 ```sh
-python -m unittest discover -s tests     # 455 tests
+python -m unittest discover -s tests     # 462 tests
 python quickfind.py --bench report       # time a query
 python quickfind.py --selftest-mft       # verify MFT enumeration (needs admin)
 ```

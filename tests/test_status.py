@@ -98,12 +98,14 @@ class TestStatusLine(unittest.TestCase):
         _results, note = self.build(paths, "note")
         self.assertIn("Add a word to narrow", note)
 
-    def test_a_scrollable_list_says_so(self):
-        # Everything that matched is in the list, but not on one screen.
+    def test_a_scrollable_list_reports_the_count(self):
+        # Everything that matched is in the list, but not on one screen. The
+        # invitation to scroll is added by the pane, which knows whether
+        # anything is below the rows in view.
         paths = [rf"C:\bucket\note{n:03d}.txt" for n in range(60)]
         _results, note = self.build(paths, "note", limit=2000)
         self.assertIn("60 matches", note)
-        self.assertIn("Scroll for more", note)
+        self.assertNotIn("Scroll for more", note)
 
     def test_no_nagging_when_everything_fits(self):
         _results, note = self.build([r"C:\a\solo.txt"], "solo")

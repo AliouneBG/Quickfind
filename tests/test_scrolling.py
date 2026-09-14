@@ -286,7 +286,49 @@ class TestViewport(unittest.TestCase):
         app = self.launcher(self.rows(400))
         app.controller.more = lambda text: (self.rows(2000), "2000 matches")
         app._deepen()
-        self.assertEqual(app.status.cget("text"), "2000 matches")
+        self.assertIn("2000 matches", app.status.cget("text"))
+
+    # -- inviting a scroll only when there is one to make -------------------
+
+    def test_a_long_list_invites_scrolling(self):
+        app = self.launcher(self.rows(500))
+        self.assertIn(ui.SCROLL_HINT.strip(), app.status.cget("text"))
+
+    def test_the_invitation_goes_away_at_the_end(self):
+        # Twenty matches, and you have reached the twentieth: there is no
+        # more, and saying so would be a lie.
+        app = self.launcher(self.rows(20))
+        self.assertIn(ui.SCROLL_HINT.strip(), app.status.cget("text"))
+        app._scroll_to(app._max_top())
+        self.assertNotIn(ui.SCROLL_HINT.strip(), app.status.cget("text"))
+
+    def test_the_invitation_comes_back_on_the_way_up(self):
+        app = self.launcher(self.rows(20))
+        app._scroll_to(app._max_top())
+        app._scroll_to(0)
+        self.assertIn(ui.SCROLL_HINT.strip(), app.status.cget("text"))
+
+    def test_a_list_that_fits_never_invites_scrolling(self):
+        app = self.launcher(self.rows(5))
+        self.assertNotIn(ui.SCROLL_HINT.strip(), app.status.cget("text"))
+
+    def test_arrowing_to_the_last_row_drops_the_invitation(self):
+        app = self.launcher(self.rows(20))
+        for _ in range(25):
+            app._move(1)
+        self.assertEqual(app._selected(), 19)
+        self.assertNotIn(ui.SCROLL_HINT.strip(), app.status.cget("text"))
+
+    def test_the_count_itself_is_kept(self):
+        app = self.launcher(self.rows(20))
+        app._scroll_to(app._max_top())
+        self.assertIn("note", app.status.cget("text"))
+
+    def test_other_messages_are_left_alone(self):
+        app = self.launcher(self.rows(500))
+        app.set_status("Rebuilding index...")
+        app._scroll_to(5)
+        self.assertEqual(app.status.cget("text"), "Rebuilding index...")
 
     def test_rows_already_on_screen_are_never_disturbed(self):
         # A deeper search interleaves repeated names over a larger pool, so

@@ -485,9 +485,11 @@ class Controller:
             note = f"{len(results)} of {total:,}{more}"
             hint = "  Add a word to narrow"
         elif len(results) > screenful:
-            # All of them are in the list; only a screenful is on show.
+            # All of them are in the list; only a screenful is on show. The
+            # invitation to scroll belongs to the pane, which knows whether
+            # there is anything below the rows currently in view.
             note = f"{len(results)} matches"
-            hint = "  Scroll for more"
+            hint = ""
         else:
             note = f"{len(results)} shown"
             hint = ""

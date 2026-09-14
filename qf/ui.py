@@ -37,6 +37,7 @@ MAX_WHEEL_LINES = 24
 # many results there are. The folder column is measured once per search from
 # at most this many rows, so that it does not shift about while scrolling.
 COLUMN_SAMPLE_ROWS = 200
+SCROLL_HINT = "  Scroll for more"
 
 # How long after a keystroke the rest of the matches are fetched. Long enough
 # that a burst of typing never pays for it, short enough to be ready well
@@ -270,6 +271,10 @@ class Launcher:
         self._top = 0
         self._cursor = -1
         self._column_px = 0
+        # The status line for the current search, and whether it is currently
+        # carrying the invitation to scroll.
+        self._note = None
+        self._hint_shown = None
         self._after_id = None
         self._deepen_id = None
         self._anim_id = None
@@ -1149,13 +1154,16 @@ class Launcher:
         # selected.
         self._top = 0
         self._cursor = 0 if self.results else -1
+        # Cleared before painting so the repaint cannot compose the previous
+        # search's status line with this search's scroll position.
+        self._note = None
         self._paint()
         if self.results:
             self._schedule_preview()
             self._schedule_deepen()
         else:
             self._clear_preview()
-        self.status.configure(text=note)
+        self._show_note(note)
         self._sync_panels()
 
     def _schedule_deepen(self) -> None:
@@ -1190,7 +1198,7 @@ class Launcher:
             return
         self.results = self.results + extra
         self._paint()
-        self.status.configure(text=note)
+        self._show_note(note)
 
     # -- the viewport ------------------------------------------------------
 
@@ -1223,6 +1231,9 @@ class Launcher:
                 self._request_icon(key, result.path, result.is_dir)
         self._paint_selection(items)
         self._sync_scrollbar()
+        # Whatever moved the viewport -- wheel, scrollbar, arrow keys -- the
+        # offer to scroll has to agree with what is below the last row.
+        self._update_note()
 
     def _ensure_items(self, count: int):
         items = list(self.tree.get_children())
@@ -1278,9 +1289,32 @@ class Launcher:
     def set_status(self, text: str) -> None:
         if not self.alive():
             return
+        # A message of its own, not a search result: no scrolling to invite.
+        self._note = None
         self.status.configure(text=text)
         if self._visible:
             self._sync_panels()
+
+    def _show_note(self, note: str) -> None:
+        """Put a search's status line up, with whatever the viewport adds."""
+        self._note = note
+        self._hint_shown = None
+        self._update_note()
+
+    def _update_note(self) -> None:
+        """Offer to scroll only while there is something below the last row.
+
+        Recomputed as the list moves: "Scroll for more" is a lie once you have
+        reached the end of twenty matches, and the count alone is the truth.
+        """
+        if self._note is None:
+            return
+        more_below = self._top < self._max_top()
+        if more_below == self._hint_shown:
+            return
+        self._hint_shown = more_below
+        self.status.configure(
+            text=self._note + (SCROLL_HINT if more_below else ""))
 
     # -- interaction -------------------------------------------------------
 
