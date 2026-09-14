@@ -9,6 +9,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from ctypes import wintypes
 from tkinter import ttk
 
 from . import shellicon, videopreview
@@ -127,6 +128,17 @@ def looks_like_text(raw: bytes) -> bool:
     return printable / len(raw) > 0.90
 
 
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_kernel32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+_kernel32.GetFileAttributesW.restype = wintypes.DWORD
+INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+FILE_ATTRIBUTE_OFFLINE = 0x00001000
+FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x00040000
+FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
+CLOUD_ONLY = (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN
+              | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+
+
 def _fine_timer(wanted: bool) -> bool:
     """Ask Windows for 1ms timers, or give them back.
 
@@ -143,6 +155,26 @@ def _fine_timer(wanted: bool) -> bool:
         return False
 
 
+def file_attributes(path: str) -> int:
+    try:
+        return _kernel32.GetFileAttributesW(path)
+    except Exception:
+        return INVALID_FILE_ATTRIBUTES
+
+
+def is_cloud_only(path: str) -> bool:
+    """A file whose contents live in the cloud rather than on this machine.
+
+    OneDrive leaves a placeholder with these attributes. Reading one asks
+    OneDrive to fetch the whole file, which is not something hovering a row
+    should start, and when the fetch cannot happen the read fails outright.
+    """
+    attributes = file_attributes(path)
+    if attributes == INVALID_FILE_ATTRIBUTES:
+        return False
+    return bool(attributes & CLOUD_ONLY)
+
+
 def read_excerpt(path: str) -> str:
     """First few lines of a text-ish file, or '' if it is not one."""
     name = os.path.basename(path).lower()
@@ -151,6 +183,9 @@ def read_excerpt(path: str) -> str:
     # README, LICENSE and Makefile carry no extension, so fall back to sniffing
     # the bytes rather than refusing to preview them.
     if not known and extension:
+        return ""
+    if is_cloud_only(path):
+        # Opening it would ask OneDrive to download the whole file.
         return ""
     try:
         with open(path, "rb") as fh:
@@ -165,7 +200,8 @@ def read_excerpt(path: str) -> str:
     return "\n".join(text.splitlines()[:EXCERPT_LINES])
 
 
-def describe(path: str, is_dir: bool, type_name: str) -> str:
+def describe(path: str, is_dir: bool, type_name: str,
+             cloud_only: bool = False) -> str:
     try:
         info = os.stat(path)
     except OSError:
@@ -173,7 +209,11 @@ def describe(path: str, is_dir: bool, type_name: str) -> str:
     when = time.strftime("%d %b %Y  %H:%M", time.localtime(info.st_mtime))
     if is_dir:
         return f"{type_name or 'Folder'}\n{when}"
-    return f"{type_name or 'File'}\n{human_size(info.st_size)}\n{when}"
+    # Say so rather than showing an empty pane and leaving the viewer to
+    # wonder why this one file previews as nothing.
+    tail = "\nOnline only, not downloaded" if cloud_only else ""
+    return (f"{type_name or 'File'}\n{human_size(info.st_size)}\n{when}"
+            f"{tail}")
 
 
 class Launcher:
@@ -207,6 +247,7 @@ class Launcher:
         self._video_frames = []
         self._video_pending = []
         self._video_index = 0
+        self._video_ticks = 0
         self._video_id = None
         self._video_start = 0.0
         self._fine_timer = False
@@ -581,13 +622,17 @@ class Launcher:
         icon, type_name = self._icons.png_for(path, is_dir, True)
         if image is None:
             image = icon
+        cloud_only = (not is_dir) and is_cloud_only(path)
         return {
             "path": path,
             "image": image,
             "is_thumbnail": is_thumbnail,
-            "meta": describe(path, is_dir, type_name),
+            "meta": describe(path, is_dir, type_name, cloud_only),
             "excerpt": "" if is_dir else read_excerpt(path),
-            "is_video": (not is_dir) and videopreview.is_video(path),
+            # Decoding a placeholder would pull the whole file down over the
+            # network, so a cloud-only video keeps its still thumbnail.
+            "is_video": (not is_dir) and videopreview.is_video(path)
+                        and not cloud_only,
         }
 
     def _pump(self) -> None:
@@ -726,6 +771,7 @@ class Launcher:
         if not self._convert_pending(VIDEO_OPENING_FRAMES):
             return
         self._video_index = 0
+        self._video_ticks = 0
         self._video_start = time.monotonic()
         if not self._fine_timer:
             _fine_timer(True)
@@ -754,8 +800,16 @@ class Launcher:
             return
         if self._video_pending:
             self._convert_pending(VIDEO_CONVERT_PER_TICK)
-        frame = self._video_frames[self._video_index % len(self._video_frames)]
-        self._video_index += 1
+        # A cursor, not a counter. Taking `counter % len` looked equivalent
+        # until frames started arriving mid-playback: the counter and the
+        # length then grew in step, the remainder stopped changing, and the
+        # preview held one frame for as long as conversion lasted, nearly
+        # three seconds on a clip measured here.
+        if self._video_index >= len(self._video_frames):
+            self._video_index = 0
+        frame = self._video_frames[self._video_index]
+        self._video_index = (self._video_index + 1) % len(self._video_frames)
+        self._video_ticks += 1
         try:
             self.preview_image_label.configure(image=frame)
         except tk.TclError:
@@ -771,7 +825,7 @@ class Launcher:
         a fixed schedule instead holds the rate, and `_fine_timer` asks Windows
         for 1ms ticks so the schedule can be met.
         """
-        due = self._video_start + self._video_index / VIDEO_FPS
+        due = self._video_start + self._video_ticks / VIDEO_FPS
         return max(1, int(round((due - time.monotonic()) * 1000)))
 
     def _stop_video(self) -> None:
@@ -791,6 +845,7 @@ class Launcher:
         self._video_frames = []
         self._video_pending = []
         self._video_index = 0
+        self._video_ticks = 0
 
     def _clear_preview(self) -> None:
         self._stop_video()

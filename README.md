@@ -391,6 +391,12 @@ a black card does not preview as a black rectangle. Decoding stops after ten
 seconds and animates whatever arrived, and a file Media Foundation cannot open
 simply keeps its still thumbnail.
 
+A file stored online only is never decoded. OneDrive leaves a placeholder whose
+contents are not on the machine, and reading one asks OneDrive to fetch the
+whole file, which is not something hovering a row should start. The preview pane
+says "Online only, not downloaded" instead of showing an empty box, and text
+excerpts are skipped for the same reason.
+
 Across a 24 video sample on the development machine, motion appeared after a
 median of 884 ms and the full six run preview took a median of 4.9 seconds, all
 of it on the worker thread with the still thumbnail already on screen.
@@ -485,7 +491,7 @@ hold on any machine.
 ## Development
 
 ```sh
-python -m unittest discover -s tests     # 404 tests
+python -m unittest discover -s tests     # 412 tests
 python quickfind.py --bench report       # time a query
 python quickfind.py --selftest-mft       # verify MFT enumeration (needs admin)
 ```
@@ -567,3 +573,5 @@ fixes that actually worked were removing the false signals ahead of it.
 * Untested on ReFS and FAT32. Both fall back to the directory walk.
 * Video previews depend on the codecs Windows has. Anything Media Foundation
   cannot open, such as ProRes, keeps its still thumbnail instead.
+* Files stored online only are not previewed at all, because reading one would
+  download it. The pane says so.

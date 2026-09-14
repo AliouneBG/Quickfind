@@ -223,6 +223,52 @@ class TestFrameComparison(unittest.TestCase):
                         * videopreview.DEFAULT_PER_SEGMENT)
 
 
+class TestCloudOnlyFiles(unittest.TestCase):
+    """OneDrive placeholders: the bytes are not here, and fetching them is not
+    something hovering a row should start."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "holiday.mp4")
+        with open(self.path, "w") as fh:
+            fh.write("x")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def pretend(self, attributes):
+        return mock.patch.object(ui, "file_attributes", return_value=attributes)
+
+    def test_an_ordinary_file_is_not_cloud_only(self):
+        self.assertFalse(ui.is_cloud_only(self.path))
+
+    def test_a_placeholder_is_spotted(self):
+        for attribute in (ui.FILE_ATTRIBUTE_OFFLINE,
+                          ui.FILE_ATTRIBUTE_RECALL_ON_OPEN,
+                          ui.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS):
+            with self.pretend(attribute | 0x20):
+                self.assertTrue(ui.is_cloud_only(self.path))
+
+    def test_a_missing_file_is_not_cloud_only(self):
+        self.assertFalse(ui.is_cloud_only(os.path.join(self.tmp.name, "no.mp4")))
+
+    def test_the_pane_says_why_it_is_empty(self):
+        meta = ui.describe(self.path, False, "MP4 Video", cloud_only=True)
+        self.assertIn("Online only", meta)
+
+    def test_an_ordinary_file_says_nothing_extra(self):
+        meta = ui.describe(self.path, False, "MP4 Video")
+        self.assertNotIn("Online only", meta)
+
+    def test_an_excerpt_is_not_read_from_one(self):
+        path = os.path.join(self.tmp.name, "notes.txt")
+        with open(path, "w") as fh:
+            fh.write("real content")
+        with self.pretend(ui.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS):
+            self.assertEqual(ui.read_excerpt(path), "")
+        self.assertIn("real content", ui.read_excerpt(path))
+
+
 class TestDecoding(unittest.TestCase):
     """Against real files, because the COM plumbing is the risky part."""
 
@@ -379,6 +425,20 @@ class TestPlayback(unittest.TestCase):
             info = self.app._build_preview_data(r"C:\v\clip.mp4", False)
         self.assertTrue(info["is_video"])
 
+    def test_a_cloud_only_video_is_not_decoded(self):
+        # It would download the whole file over the network on hover.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "clip.mp4")
+            with open(path, "w") as fh:
+                fh.write("x")
+            with mock.patch.object(ui.shellicon, "thumbnail_png",
+                                   return_value=None), \
+                 mock.patch.object(ui, "read_excerpt", return_value=""), \
+                 mock.patch.object(ui, "is_cloud_only", return_value=True):
+                info = self.app._build_preview_data(path, False)
+        self.assertFalse(info["is_video"])
+        self.assertIn("Online only", info["meta"])
+
     def test_documents_are_not_flagged(self):
         with mock.patch.object(ui.shellicon, "thumbnail_png", return_value=None), \
              mock.patch.object(ui, "read_excerpt", return_value=""):
@@ -419,6 +479,28 @@ class TestPlayback(unittest.TestCase):
         self.app._advance_video()
         self.assertNotEqual(self.app._video_index, first)
 
+    def test_a_growing_loop_still_advances(self):
+        """The frame on screen must move even while frames keep arriving.
+
+        With a counter and `counter % len(frames)`, the counter and the length
+        grew in step as each new frame was converted, the remainder stopped
+        changing, and the preview held a single frame for as long as the
+        decode lasted: 2.75 seconds on one clip.
+        """
+        self.app.show()
+        self.app._start_video(self.frames)
+        # Run the loop past the end so the cursor has wrapped, then keep
+        # feeding it, which is what happens when a later run lands.
+        for _ in range(len(self.frames) + 1):
+            self.app._advance_video()
+        shown = []
+        for _ in range(15):
+            self.app._video_pending.append(self.frames[0])
+            shown.append(self.app._video_index)
+            self.app._advance_video()
+        repeats = [a for a, b in zip(shown, shown[1:]) if a == b]
+        self.assertEqual(repeats, [], "the preview froze on one frame")
+
     def test_playback_loops_past_the_last_frame(self):
         self.app.show()
         self.app._start_video(self.frames)
@@ -428,7 +510,7 @@ class TestPlayback(unittest.TestCase):
 
     def test_the_frame_clock_asks_for_one_interval(self):
         self.app._video_start = time.monotonic()
-        self.app._video_index = 1
+        self.app._video_ticks = 1
         delay = self.app._next_delay()
         self.assertAlmostEqual(delay, 1000 / ui.VIDEO_FPS, delta=4)
 
@@ -437,12 +519,12 @@ class TestPlayback(unittest.TestCase):
         # every tick, which is what held a nominal 12fps loop to 10.7fps.
         interval = 1.0 / ui.VIDEO_FPS
         self.app._video_start = time.monotonic() - interval * 1.5
-        self.app._video_index = 1
+        self.app._video_ticks = 1
         self.assertLess(self.app._next_delay(), 1000 / ui.VIDEO_FPS)
 
     def test_the_wait_is_never_zero(self):
         self.app._video_start = time.monotonic() - 60
-        self.app._video_index = 1
+        self.app._video_ticks = 1
         self.assertGreaterEqual(self.app._next_delay(), 1)
 
     def test_playing_asks_for_a_finer_system_timer(self):
