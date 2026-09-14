@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime state lives in %APPDATA% / %LOCALAPPDATA%, never in the repo:
+# config.json, index.pkl, usage.json, quickfind.log
+*.pkl
+*.log
