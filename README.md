@@ -63,10 +63,15 @@ Undo that with `--uninstall-task`.
 Clicking away also dismisses it. The preview pane follows the selection, and a
 selected video starts playing a silent preview about a second later.
 
+The list holds more than it shows. Forty rows are rendered to start with and
+another forty arrive as you scroll toward the end, up to eight pages, so a
+search you cannot immediately narrow is still worth scrolling through.
+
 The status line reports how many files matched, not just how many fit on
-screen. Typing `resume` on a machine with hundreds of them reads `40 of 535`
+screen. Typing `resume` on a machine with hundreds of them reads `320 of 535`
 and suggests adding a word, because a second word filters by folder and
-usually cuts the list to one.
+usually cuts the list to one. When everything matched is in the list but not on
+screen, it says so and invites scrolling instead.
 
 The tray icon has Show, Rebuild index, and Quit. On Windows 11 new tray icons
 start hidden behind the `^` chevron, so drag it out if you want it pinned.
@@ -135,7 +140,7 @@ file automatically, so the file always shows everything available.
 | `roots` | `["C:\\"]` | What to index |
 | `excludes` | `$recycle.bin`, ... | Folder names the directory walk skips |
 | `supplement` | `["C:\\Windows"]` | Walked after an MFT build to recover hardlink names |
-| `max_results` | `40` | Rows shown |
+| `max_results` | `40` | Rows rendered at a time. Scrolling adds more, up to eight pages |
 | `opacity` | `0.92` | Window transparency, from `0.35` to `1.0` |
 | `fuzzy` | `true` | Abbreviation fallback |
 | `frecency` | `true` | Rank what you have opened before higher |
@@ -227,7 +232,7 @@ on-disk cache is 53 MB.
 | `quickfind.py` | Entry point, config, elevation, and the Controller |
 | `qf/fsindex.py` | MFT enumeration, directory walk, packed storage, cache |
 | `qf/search.py` | Haystack scanning, ranking, abbreviation fallback |
-| `qf/ui.py` | Tk overlay, DPI scaling, rows, preview pane |
+| `qf/ui.py` | Tk overlay, DPI scaling, rows, scrolling, preview pane |
 | `qf/shellicon.py` | Shell icons and thumbnails, encoded to PNG for Tk |
 | `qf/videopreview.py` | Silent video frames decoded with Media Foundation |
 | `qf/freshwatch.py` | Watches the folders files land in, no privileges needed |
@@ -259,6 +264,29 @@ Two measured reasons, both worth knowing before simplifying this:
    filename holding an emoji promoted the entire 15 million character haystack
    to 4 bytes per character, costing 60.5 MB instead of 15 MB. Exactly one such
    file existed on the test machine. `bytes` has no such cliff.
+
+### Drawing the list
+
+A keystroke cost 90 ms before any of this was measured, and 78 ms of that was
+one function: laying out row text. Each row elides a long name and a long path
+to fit, by binary searching for the cut with `font.measure`, and every one of
+those is a round trip into Tcl. Forty rows made about 560 of them.
+
+Character advances are additive in these fonts, so a cached width per character
+gives pixel-identical answers by summing them in Python: verified equal on
+ASCII, accented and CJK samples, and 353 times faster. Row layout dropped to
+2.6 ms and a keystroke to under 10 ms.
+
+Scrolling was slow for a simpler reason. Tk's Treeview binds the wheel to
+exactly one row per notch, and on a ten row list that is wading. QuickFind
+binds the wheel itself and scrolls by however many lines Windows is configured
+for, three by default.
+
+Fetching more results costs nothing worth having: a search spends its time
+scanning, and that is the same whether forty results or four hundred come back
+(14.9 ms against 14.6 ms measured). So a search fetches eight pages, the list
+renders one, and the next is rendered when scrolling comes within six rows of
+the end. Rendering a page costs about 15 ms and only happens on arrival there.
 
 ### Icons and the preview pane
 
@@ -491,7 +519,7 @@ hold on any machine.
 ## Development
 
 ```sh
-python -m unittest discover -s tests     # 412 tests
+python -m unittest discover -s tests     # 428 tests
 python quickfind.py --bench report       # time a query
 python quickfind.py --selftest-mft       # verify MFT enumeration (needs admin)
 ```

@@ -85,14 +85,22 @@ class TestStatusLine(unittest.TestCase):
         return quickfind.Controller.query(stub, query)
 
     def test_reports_the_share_you_are_seeing(self):
-        paths = [rf"C:\bucket\note{n:03d}.txt" for n in range(60)]
+        # More matches than one search will fetch, so say how many exist.
+        paths = [rf"C:\bucket\note{n:03d}.txt" for n in range(600)]
         _results, note = self.build(paths, "note")
-        self.assertIn("10 of 60", note)
+        self.assertIn("of 600", note)
 
     def test_suggests_narrowing_when_truncated(self):
-        paths = [rf"C:\bucket\note{n:03d}.txt" for n in range(60)]
+        paths = [rf"C:\bucket\note{n:03d}.txt" for n in range(600)]
         _results, note = self.build(paths, "note")
         self.assertIn("Add a word to narrow", note)
+
+    def test_a_scrollable_list_says_so(self):
+        # Everything that matched is in the list, but not on one screen.
+        paths = [rf"C:\bucket\note{n:03d}.txt" for n in range(60)]
+        _results, note = self.build(paths, "note")
+        self.assertIn("60 matches", note)
+        self.assertIn("Scroll for more", note)
 
     def test_no_nagging_when_everything_fits(self):
         _results, note = self.build([r"C:\a\solo.txt"], "solo")

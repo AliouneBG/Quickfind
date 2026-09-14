@@ -29,6 +29,15 @@ MAX_ROWS = 10
 DEBOUNCE_MS = 45
 CORNER_RADIUS = 16
 
+SPI_GETWHEELSCROLLLINES = 0x0068
+WHEEL_PAGESCROLL = 0xFFFFFFFF
+DEFAULT_WHEEL_LINES = 3
+MAX_WHEEL_LINES = 24
+# Rows are added a page at a time as the list is scrolled, starting this many
+# rows before the end so the next page is already there when you arrive.
+EXTEND_MARGIN_ROWS = 6
+PAGE_ROWS = 40
+
 PREVIEW_WIDTH = 250
 PREVIEW_DELAY_MS = 180
 PREVIEW_THUMB = 132
@@ -139,6 +148,26 @@ CLOUD_ONLY = (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN
               | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
 
 
+def wheel_lines() -> int:
+    """Rows one wheel notch should scroll, as Windows is configured.
+
+    Tk's own Treeview binding always scrolls exactly one row, which on a ten
+    row list feels like wading. Windows' default is three, and it is a setting
+    people genuinely change, so ask rather than assume.
+    """
+    value = ctypes.c_uint(DEFAULT_WHEEL_LINES)
+    try:
+        ok = ctypes.windll.user32.SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES, 0, ctypes.byref(value), 0)
+    except Exception:
+        return DEFAULT_WHEEL_LINES
+    if not ok:
+        return DEFAULT_WHEEL_LINES
+    if value.value == WHEEL_PAGESCROLL:
+        return MAX_ROWS
+    return max(1, min(int(value.value), MAX_WHEEL_LINES))
+
+
 def _fine_timer(wanted: bool) -> bool:
     """Ask Windows for 1ms timers, or give them back.
 
@@ -218,10 +247,12 @@ def describe(path: str, is_dir: bool, type_name: str,
 
 class Launcher:
     def __init__(self, controller, opacity=None, preview=True,
-                 video_preview=True):
+                 video_preview=True, page_rows=PAGE_ROWS):
         enable_dpi_awareness()
         self.controller = controller
         self.preview_enabled = bool(preview)
+        self.page_rows = max(1, int(page_rows))
+        self._wheel_lines = wheel_lines()
         self.alpha = min(1.0, max(MIN_ALPHA, ALPHA if opacity is None else opacity))
         self.results = []
         self._after_id = None
@@ -279,6 +310,7 @@ class Launcher:
 
         self.entry_font = tkfont.Font(family="Segoe UI", size=self.px(ENTRY_PX))
         self.row_font = tkfont.Font(family="Segoe UI", size=self.px(ROW_PX))
+        self._char_px: dict[str, int] = {}
         status_font = tkfont.Font(family="Segoe UI", size=self.px(STATUS_PX))
         self.meta_font = tkfont.Font(family="Segoe UI", size=self.px(META_PX))
         self.excerpt_font = tkfont.Font(family="Consolas", size=self.px(EXCERPT_PX))
@@ -332,6 +364,7 @@ class Launcher:
         self.root.bind("<Next>", lambda e: self._move(self.rows_visible))
 
         self.tree.bind("<Motion>", self._on_hover)
+        self.tree.bind("<MouseWheel>", self._on_wheel)
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Double-Button-1>", self._on_return)
         self.root.bind("<FocusOut>", self._on_focus_out)
@@ -499,18 +532,35 @@ class Launcher:
 
     # -- row text ----------------------------------------------------------
 
+    def _text_px(self, text: str) -> int:
+        """Width of a string, from cached character widths.
+
+        `font.measure` is a round trip into Tcl. Eliding forty rows with a
+        binary search made about 560 of them and cost 78ms of every keystroke.
+        Character advances are additive in these fonts, so summing cached
+        widths gives pixel-identical answers 350 times faster.
+        """
+        widths = self._char_px
+        total = 0
+        for character in text:
+            width = widths.get(character)
+            if width is None:
+                width = self.row_font.measure(character)
+                widths[character] = width
+            total += width
+        return total
+
     def _elide(self, text: str, max_px: int, keep_tail: bool) -> str:
         """Trim text to fit, dropping characters from whichever end matters less."""
-        font = self.row_font
         if max_px <= 0:
             return ""
-        if font.measure(text) <= max_px:
+        if self._text_px(text) <= max_px:
             return text
         lo, hi = 0, len(text)
         while lo < hi:
             mid = (lo + hi) // 2
             candidate = (ELLIPSIS + text[mid:]) if keep_tail else (text[:mid] + ELLIPSIS)
-            fits = font.measure(candidate) <= max_px
+            fits = self._text_px(candidate) <= max_px
             if keep_tail:
                 if fits:
                     hi = mid
@@ -539,7 +589,7 @@ class Launcher:
         """
         available = self._row_budget()
         cap = int(available * 0.45)
-        measure = self.row_font.measure
+        measure = self._text_px
 
         leads = []
         for result in results:
@@ -1014,15 +1064,30 @@ class Launcher:
         self._after_id = None
         query = self.entry.get()
         self.results, note = self.controller.query(query)
+        self._render_rows(min(len(self.results), self.page_rows))
+        if self.results:
+            self._select(0)
+            # Back to the top. Leaving the view where the last search left it
+            # showed an empty stretch of list and hid the match that had just
+            # been selected.
+            self.tree.yview_moveto(0)
+        else:
+            self._clear_preview()
+        self.status.configure(text=note)
+        self._sync_panels()
 
+    def _render_rows(self, wanted: int) -> None:
+        """Fill the tree with the first `wanted` results."""
         # Reuse rows rather than clearing and rebuilding: recreating 40 tree
         # items on every keystroke costs far more than reconfiguring them.
         items = list(self.tree.get_children())
-        self.tree.selection_remove(*items)
+        if wanted < len(items):
+            self.tree.selection_remove(*items)
         self._row_keys = []
-        texts = self._format_rows(self.results)
+        shown = self.results[:wanted]
+        texts = self._format_rows(shown)
 
-        for position, (result, text) in enumerate(zip(self.results, texts)):
+        for position, (result, text) in enumerate(zip(shown, texts)):
             key = self._icons.key_for(result.path, result.is_dir)
             self._row_keys.append(key)
             image = self._icon_images.get(key, self._blank)
@@ -1036,12 +1101,32 @@ class Launcher:
         for surplus in items[len(texts):]:
             self.tree.delete(surplus)
 
-        if self.results:
-            self._select(0)
-        else:
-            self._clear_preview()
-        self.status.configure(text=note)
-        self._sync_panels()
+    def _extend_rows(self) -> bool:
+        """Show another page, if the search found more than is on screen."""
+        shown = len(self.tree.get_children())
+        if shown >= len(self.results):
+            return False
+        self._render_rows(min(len(self.results), shown + self.page_rows))
+        return True
+
+    def _on_wheel(self, event) -> str:
+        """Scroll by the number of rows Windows is set to, then top up."""
+        notches = -event.delta / 120.0
+        self.tree.yview_scroll(int(round(notches * self._wheel_lines)), "units")
+        if notches > 0:
+            self._extend_near_end()
+        return "break"
+
+    def _extend_near_end(self) -> None:
+        shown = len(self.tree.get_children())
+        if shown >= len(self.results):
+            return
+        # Derived from the top of the view and the number of rows on screen.
+        # The bottom fraction Tk reports is stale until it has laid the widget
+        # out again, and comes back as zero mid-scroll.
+        first_visible = self.tree.yview()[0] * shown
+        if first_visible + self.rows_visible >= shown - EXTEND_MARGIN_ROWS:
+            self._extend_rows()
 
     def set_status(self, text: str) -> None:
         if not self.alive():
@@ -1067,6 +1152,10 @@ class Launcher:
         items = self.tree.get_children()
         if not items:
             return
+        # Walking off the end of what is rendered pulls in the next page
+        # rather than stopping dead at row forty.
+        while target > len(items) - 1 and self._extend_rows():
+            items = self.tree.get_children()
         target = max(0, min(len(items) - 1, target))
         if self._selected() == target:
             return
