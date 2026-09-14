@@ -31,7 +31,7 @@ OPEN_EXISTING = 3
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 ERROR_HANDLE_EOF = 38
 
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 PATH_CACHE_MAX = 60_000
 DEFAULT_EXCLUDES = ("$recycle.bin", "system volume information", "winsxs")
 
@@ -44,7 +44,7 @@ DEFAULT_SUPPLEMENT = (r"C:\Windows",)
 
 # USN_RECORD_V2: length/versions/FRN/parent FRN at 0, then attributes and the
 # name's length and offset at 52. Precompiled because this runs 1.4M times.
-_USN_HEAD = struct.Struct("<IHHQQ")
+_USN_HEAD = struct.Struct("<IHHQQqq")
 _USN_TAIL = struct.Struct("<IHH")
 _MFT_BUFFER = 1 << 22
 
@@ -85,7 +85,7 @@ class _NameView:
 class Index:
     """Flat parallel-array store of every indexed filesystem entry."""
 
-    __slots__ = ("blob", "starts", "parents", "isdir", "roots",
+    __slots__ = ("blob", "starts", "parents", "isdir", "mtimes", "roots",
                  "built_at", "source", "_depth", "_path_cache")
 
     def __init__(self) -> None:
@@ -93,6 +93,9 @@ class Index:
         self.starts = array.array("q", [0])
         self.parents = array.array("i")
         self.isdir = bytearray()
+        # Seconds since the epoch, 0 when unknown. uint32 is good until 2106
+        # and costs 4 bytes an entry instead of 8.
+        self.mtimes = array.array("I")
         self.roots: dict[int, str] = {}
         self.built_at = 0.0
         self.source = "empty"
@@ -106,11 +109,12 @@ class Index:
     def names(self):
         return _NameView(self)
 
-    def add(self, name: str, parent: int, isdir: bool) -> int:
+    def add(self, name: str, parent: int, isdir: bool, mtime: int = 0) -> int:
         self.blob += name.encode("utf-8")
         self.starts.append(len(self.blob))
         self.parents.append(parent)
         self.isdir.append(1 if isdir else 0)
+        self.mtimes.append(mtime if 0 < mtime < 0xFFFFFFFF else 0)
         return len(self.parents) - 1
 
     def name(self, i: int) -> str:
@@ -217,7 +221,13 @@ def build_by_walk(roots, excludes=DEFAULT_EXCLUDES, progress=None) -> Index:
                         is_dir = entry.is_dir(follow_symlinks=False)
                     except OSError:
                         continue
-                    i = idx.add(entry.name, parent_i, is_dir)
+                    try:
+                        # scandir carries stat data on Windows, so this costs
+                        # no extra syscall.
+                        mtime = int(entry.stat(follow_symlinks=False).st_mtime)
+                    except (OSError, ValueError, OverflowError):
+                        mtime = 0
+                    i = idx.add(entry.name, parent_i, is_dir, mtime)
                     if not is_dir or entry.name.lower() in skip:
                         continue
                     try:
@@ -282,6 +292,7 @@ def build_by_mft(drive: str) -> Index:
     starts = idx.starts
     parents = idx.parents
     isdir = idx.isdir
+    mtimes = idx.mtimes
     head_unpack = _USN_HEAD.unpack_from
     tail_unpack = _USN_TAIL.unpack_from
 
@@ -312,17 +323,21 @@ def build_by_mft(drive: str) -> Index:
             start_frn = struct.unpack_from("<Q", chunk, 0)[0]
             offset = 8
             while offset < n:
-                rec_len, _major, _minor, frn, pfrn = head_unpack(chunk, offset)
+                (rec_len, _major, _minor, frn, pfrn, _usn,
+                 filetime) = head_unpack(chunk, offset)
                 if rec_len == 0 or offset + rec_len > n:
                     break
                 attrs, name_len, name_off = tail_unpack(chunk, offset + 52)
                 name_at = offset + name_off
                 name = str(chunk[name_at:name_at + name_len], "utf-16-le", "replace")
 
+                # FILETIME counts 100ns ticks from 1601; shift to the epoch.
+                stamp = filetime // 10_000_000 - 11_644_473_600
                 blob += name.encode("utf-8")
                 starts.append(len(blob))
                 parents.append(-1)
                 isdir.append(1 if attrs & FILE_ATTRIBUTE_DIRECTORY else 0)
+                mtimes.append(stamp if 0 < stamp < 0xFFFFFFFF else 0)
                 append_frn(frn)
                 append_parent(pfrn)
                 offset += rec_len
@@ -379,6 +394,7 @@ def _merge(target: Index, other: Index) -> None:
     for k in range(1, len(other.starts)):
         target.starts.append(base + other.starts[k])
     target.isdir.extend(other.isdir)
+    target.mtimes.extend(other.mtimes)
     for p in other.parents:
         target.parents.append(p if p < 0 else p + shift)
     for i, label in other.roots.items():
@@ -400,6 +416,7 @@ def save(idx: Index, path: str | None = None) -> str:
         "starts": idx.starts.tobytes(),
         "parents": idx.parents.tobytes(),
         "isdir": bytes(idx.isdir),
+        "mtimes": idx.mtimes.tobytes(),
         "roots": idx.roots,
         "built_at": idx.built_at,
         "source": idx.source,
@@ -427,6 +444,8 @@ def load(path: str | None = None) -> Index | None:
     idx.parents = array.array("i")
     idx.parents.frombytes(payload["parents"])
     idx.isdir = bytearray(payload["isdir"])
+    idx.mtimes = array.array("I")
+    idx.mtimes.frombytes(payload["mtimes"])
     idx.roots = payload["roots"]
     idx.built_at = payload["built_at"]
     idx.source = payload["source"]

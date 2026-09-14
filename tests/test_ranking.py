@@ -124,11 +124,18 @@ class TestSpreading(unittest.TestCase):
         self.paths = [rf"C:\vendor\copy{n}\shared.txt" for n in range(8)]
         self.paths.append(r"C:\Users\me\notes\shared_notes.txt")
 
-    def test_repeats_are_progressively_demoted(self):
+    def test_one_name_cannot_claim_every_visible_row(self):
         s = searcher_for(self.paths)
-        scores = [r.score for r in s.search("shared.txt", 40)]
-        self.assertEqual(scores, sorted(scores, reverse=True))
-        self.assertGreater(scores[0] - scores[-1], search.DUPLICATE_PENALTY)
+        names = [r.name.lower() for r in s.search("shared", 40)]
+        front = names[:search.DUPLICATE_QUOTA + 1]
+        self.assertLess(front.count("shared.txt"), len(front),
+                        "a distinct name must get a slot near the top")
+
+    def test_deferred_copies_are_still_reachable(self):
+        # Deferring, not penalising: every copy stays in the result set.
+        s = searcher_for(self.paths)
+        found = [r.path for r in s.search("shared.txt", 40)]
+        self.assertEqual(len(found), 8)
 
     def test_a_distinct_name_rises_above_the_repeats(self):
         s = searcher_for(self.paths)
@@ -165,9 +172,12 @@ class TestNoRegressions(unittest.TestCase):
         self.assertEqual(ranked(s, "report beta"),
                          [r"C:\Users\me\beta\report.txt"])
 
-    def test_results_remain_sorted_by_score(self):
+    def test_copies_of_one_name_stay_in_score_order(self):
+        # Spreading interleaves names, so global score order is no longer the
+        # contract. Within a single name the best copy must still come first.
         s = searcher_for([rf"C:\Users\me\dir{n}\report.txt" for n in range(6)])
-        scores = [r.score for r in s.search("report", 40)]
+        scores = [r.score for r in s.search("report", 40)
+                  if r.name.lower() == "report.txt"]
         self.assertEqual(scores, sorted(scores, reverse=True))
 
 

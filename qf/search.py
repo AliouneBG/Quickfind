@@ -32,6 +32,7 @@ from __future__ import annotations
 import array
 import os
 import re
+import time
 from bisect import bisect_right
 
 MAX_SCAN_HITS = 12000
@@ -45,11 +46,14 @@ FUZZY_MAX_HITS = 2000
 FUZZY_CEILING = 140.0
 
 HOME_BONUS = 70.0
-# Ten copies of the same filename should not fill the list. Each repeat costs
-# more than the last, so a genuinely better duplicate can still surface while
-# a wall of vendored copies cannot crowd out everything else.
-DUPLICATE_PENALTY = 70.0
-DUPLICATE_STEPS = 5
+# Recently edited files are usually the ones you mean. Kept modest so it breaks
+# ties and lifts "the updated one" without overriding how well a name matched:
+# 158 resumes differing only by folder are separated by date, not by name.
+RECENCY_BONUS = 90.0
+RECENCY_HALF_LIFE_DAYS = 45.0
+# How many rows one filename may claim before the rest queue behind whatever
+# else matched. See Searcher._spread for why this defers instead of penalising.
+DUPLICATE_QUOTA = 2
 # Paths that are real but rarely what was meant. Milder than NOISE, because
 # these are legitimate hits -- just not the canonical one.
 DEMOTED = (
@@ -77,6 +81,10 @@ NOISE = (
     "\\appdata\\local\\temp\\", "\\appdata\\local\\packages\\",
     "\\node_modules\\", "\\.git\\", "\\__pycache__\\", "\\windows\\winsxs\\",
     "\\$recycle.bin\\", "\\site-packages\\", "\\.cache\\",
+    # Bundled application internals. An Electron app ships thousands of icons
+    # and stubs with ordinary words for names: VS Code's media-player
+    # "resume.svg" was outranking every real resume document on the machine.
+    "\\resources\\app\\", "\\user data\\default\\extensions\\",
 )
 
 
@@ -105,6 +113,7 @@ class Searcher:
         self._offsets = array.array("q")
         self._last_primary = ""
         self._last_hits: list[int] | None = None
+        self._now = time.time()
         self.build()
 
     def build(self) -> None:
@@ -286,6 +295,12 @@ class Searcher:
         # matches rather than promoting something irrelevant.
         if self.usage is not None:
             score += self.usage.boost(lowered_path)
+        mtime = self.index.mtimes[i] if i < len(self.index.mtimes) else 0
+        if mtime:
+            age_days = (self._now - mtime) / 86400.0
+            if age_days < 0:
+                age_days = 0.0
+            score += RECENCY_BONUS * (0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS))
         if rest:
             lowered_name = self.index.name(i).lower()
             for token in rest:
@@ -303,6 +318,7 @@ class Searcher:
             self._last_hits = None
             return []
 
+        self._now = time.time()
         tokens = query.split()
         primary_text, rest = tokens[0], tokens[1:]
         primary = primary_text.encode("utf-8")
@@ -392,17 +408,27 @@ class Searcher:
                 break
 
         results.sort(key=lambda r: -r.score)
-        self._spread(results)
-        results.sort(key=lambda r: -r.score)
-        return results[:limit]
+        return self._spread(results)[:limit]
 
     @staticmethod
-    def _spread(results) -> None:
-        """Demote repeats of a filename already shown, progressively."""
+    def _spread(results):
+        """Interleave so one filename cannot monopolise the visible rows.
+
+        This defers rather than penalises. Scoring duplicates down was the
+        obvious approach and it failed both ways: a steep penalty buried 158
+        resumes that differed only by folder, and a shallow one let eight
+        vendored clones push the single distinctly named file off the end.
+
+        Deferring has no such tension. Every name keeps its score and its best
+        copy stays ahead of its worse ones. Copies past the quota simply queue
+        behind whatever variety exists, so they are still reachable by
+        scrolling instead of being pushed below unrelated results.
+        """
         seen = {}
+        front, deferred = [], []
         for result in results:
             key = result.name.lower()
-            repeats = seen.get(key, 0)
-            seen[key] = repeats + 1
-            if repeats:
-                result.score -= DUPLICATE_PENALTY * min(repeats, DUPLICATE_STEPS)
+            count = seen.get(key, 0)
+            seen[key] = count + 1
+            (front if count < DUPLICATE_QUOTA else deferred).append(result)
+        return front + deferred
