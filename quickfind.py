@@ -20,7 +20,8 @@ import sys
 import threading
 import time
 
-from qf import fsindex, hotkey, search, single, tray, ui, usage, watcher
+from qf import (freshwatch, fsindex, hotkey, search, single, tray, ui,
+                usage, watcher)
 
 DEFAULT_CONFIG = {
     "hotkey": "alt+space",
@@ -36,12 +37,17 @@ DEFAULT_CONFIG = {
     "tray": True,
     "elevate": True,
     "watch": True,
+    "live_folders": True,
     "watch_quiet_seconds": 6,
     "min_rebuild_seconds": 90,
     "refresh_after_hours": 12,
 }
 
 WARM_THRESHOLD = 50_000
+# How many newly created files are carried alongside the index, and how often
+# that small index is rebuilt while files are pouring in.
+FRESH_MAX = 3000
+FRESH_REBUILD_SECONDS = 1.0
 TASK_NAME = "QuickFind"
 
 
@@ -188,6 +194,13 @@ class Controller:
         self._change_at = None
         self._pending_changes = 0
         self._last_rebuild = 0.0
+        # Files that appeared after the index was built. Searched alongside it,
+        # because rebuilding the 15 MB haystack for one download costs 600ms
+        # and rebuilding the index itself costs far more.
+        self._fresh: dict[str, tuple[str, float]] = {}
+        self._fresh_dirty = False
+        self._fresh_at = 0.0
+        self.fresh_searcher: search.Searcher | None = None
         self._drain_id = self.app.root.after(80, self._drain)
 
     # -- requests from other threads ---------------------------------------
@@ -203,6 +216,10 @@ class Controller:
 
     def request_refresh(self, changes: int) -> None:
         self._events.put(("changed", changes))
+
+    def request_fresh(self, path: str, removed: bool, is_dir: bool = False,
+                      mtime: int = 0) -> None:
+        self._events.put(("fresh", (path, removed, is_dir, mtime)))
 
     # -- indexing ----------------------------------------------------------
 
@@ -262,14 +279,93 @@ class Controller:
                 elif kind == "changed":
                     self._pending_changes += payload
                     self._change_at = time.time()
+                elif kind == "fresh":
+                    self._note_fresh(*payload)
                 elif kind == "quit":
                     self.app.root.quit()
                     return
         except queue.Empty:
             pass
+        self._refresh_fresh()
         self._maybe_refresh()
         if self.app.alive():
             self._drain_id = self.app.root.after(80, self._drain)
+
+    # -- files that appeared since the last build ---------------------------
+
+    def _note_fresh(self, path: str, removed: bool, is_dir: bool = False,
+                    mtime: int = 0) -> None:
+        key = path.lower()
+        if removed:
+            self._fresh_dirty |= self._fresh.pop(key, None) is not None
+            return
+        if key in self._fresh:
+            return
+        if len(self._fresh) >= FRESH_MAX:
+            # Insertion-ordered, so this drops the oldest.
+            self._fresh.pop(next(iter(self._fresh)))
+        self._fresh[key] = (path, bool(is_dir), int(mtime), time.time())
+        self._fresh_dirty = True
+
+    def _refresh_fresh(self, force: bool = False) -> None:
+        """Re-index the fresh paths, at most once a second unless forced.
+
+        Unzipping an archive fires an event per file, and rebuilding per file
+        would be wasteful. Nothing is stat'd here, because the watcher thread
+        already looked, so even a full list costs about 10ms and can stay on
+        the UI thread.
+        """
+        if not self._fresh_dirty:
+            return
+        now = time.time()
+        if not force and now - self._fresh_at < FRESH_REBUILD_SECONDS:
+            return
+        self._fresh_dirty = False
+        self._fresh_at = now
+        if not self._fresh:
+            self.fresh_searcher = None
+            return
+        idx = fsindex.from_paths(
+            (path, is_dir, mtime) for path, is_dir, mtime, _at
+            in self._fresh.values())
+        self.fresh_searcher = search.Searcher(idx, self.usage) if len(idx) else None
+
+    def _forget_fresh(self, indexed_at: float) -> None:
+        """Drop what the new index already holds, keeping anything newer."""
+        self._fresh = {key: value for key, value in self._fresh.items()
+                       if value[3] > indexed_at}
+        self._fresh_dirty = True
+        self._fresh_at = 0.0
+        self.fresh_searcher = None
+
+    def _with_fresh(self, text: str, results: list):
+        """Fold fresh files into ranked results without disturbing their order.
+
+        The main list is already interleaved to keep identically named files
+        from crowding each other out, so it is merged into rather than
+        re-sorted.
+        """
+        # A file that arrived seconds ago is exactly what someone is searching
+        # for, so a query is worth the rebuild rather than waiting for the timer.
+        self._refresh_fresh(force=True)
+        if self.fresh_searcher is None:
+            return results, 0
+        limit = self.cfg["max_results"]
+        extra = self.fresh_searcher.search(text, limit,
+                                           fuzzy=self.cfg.get("fuzzy", True))
+        known = {r.path.lower() for r in results}
+        extra = [r for r in extra if r.path.lower() not in known]
+        if not extra:
+            return results, 0
+        merged = []
+        i = 0
+        for item in extra:
+            while i < len(results) and results[i].score >= item.score:
+                merged.append(results[i])
+                i += 1
+            merged.append(item)
+        merged.extend(results[i:])
+        return merged[:limit], len(extra)
 
     def _maybe_refresh(self) -> None:
         """Rebuild after the filesystem has been quiet for a moment.
@@ -302,6 +398,9 @@ class Controller:
 
     def _install(self, idx) -> None:
         self.searcher = search.Searcher(idx, self.usage)
+        # Anything noted before this index was built is now in it. Anything
+        # noted while it was building is not, so it stays.
+        self._forget_fresh(idx.built_at)
         if len(idx) > WARM_THRESHOLD:
             # Precompute the depth table off-thread; otherwise the first query
             # pays for it and lands ~150ms slower than every one after it.
@@ -329,6 +428,7 @@ class Controller:
         started = time.perf_counter()
         results = self.searcher.search(text, self.cfg["max_results"],
                                        fuzzy=self.cfg.get("fuzzy", True))
+        results, fresh_count = self._with_fresh(text, results)
         elapsed_ms = (time.perf_counter() - started) * 1000
         if not results:
             return [], f"No matches  ({elapsed_ms:.0f} ms)"
@@ -337,6 +437,8 @@ class Controller:
         # machine matches 535 files; showing "40 shown" implied that was all of
         # them, and gave no hint that a second word would cut it to one.
         total = self.searcher.last_total
+        if total is not None:
+            total += fresh_count
         if total is not None and total > len(results):
             more = "+" if self.searcher.last_total_capped else ""
             note = f"{len(results)} of {total:,}{more}"
@@ -366,8 +468,9 @@ class Controller:
             count = len(self.searcher.index) if self.searcher else 0
             source = self.searcher.index.source if self.searcher else "none"
             admin = "yes" if fsindex.is_admin() else "no"
+            fresh = f" + {len(self._fresh)} new" if self._fresh else ""
             self.app.set_status(
-                f"{count:,} items - source {source} - admin {admin} - "
+                f"{count:,} items{fresh} - source {source} - admin {admin} - "
                 f"{len(self.usage)} remembered - hotkey {self.cfg['hotkey']}"
             )
         else:
@@ -572,9 +675,28 @@ def main() -> int:
                   file=sys.stderr)
             change_watcher = None
 
+    # Without elevation the change journal is closed to us, so watch the
+    # folders files actually land in. New downloads are then findable within a
+    # second instead of waiting for the next rebuild.
+    folder_watcher = None
+    setting = cfg.get("live_folders", True)
+    if setting:
+        # `true` means the usual places files land; a list names them instead.
+        folders = (list(setting) if isinstance(setting, list)
+                   else freshwatch.default_folders())
+        folder_watcher = freshwatch.FolderWatcher(
+            folders, controller.request_fresh,
+            on_overflow=lambda: controller.request_refresh(1))
+        if not folder_watcher.start():
+            print(f"live folder watch off ({folder_watcher.error})",
+                  file=sys.stderr)
+            folder_watcher = None
+
     controller.start(force_rebuild=args.reindex)
     mode = "administrator" if fsindex.is_admin() else "standard user"
     live = "live index updates on" if change_watcher else "periodic refresh"
+    if folder_watcher is not None:
+        live += ", watching new files"
     log(f"ready as {mode}, {live}, tray={'on' if tray_icon else 'off'}")
     print(f"QuickFind running as {mode}, {live}. "
           f"Press {cfg['hotkey']} to search.")

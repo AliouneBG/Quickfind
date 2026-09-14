@@ -73,6 +73,12 @@ class TestStatusLine(unittest.TestCase):
             cfg = {"max_results": limit, "fuzzy": True}
             _indexing = False
             _scanned = 0
+            # Nothing has arrived since the index was built, but the real
+            # methods run so the status line is exercised as it ships.
+            fresh_searcher = None
+            _fresh_dirty = False
+            _refresh_fresh = quickfind.Controller._refresh_fresh
+            _with_fresh = quickfind.Controller._with_fresh
 
         stub = Stub()
         stub.searcher = searcher

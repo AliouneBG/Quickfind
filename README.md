@@ -15,6 +15,7 @@ library, so there is nothing to install, no virtualenv, and no build step.
 * Windows shell icons on every row.
 * Preview pane with thumbnails for images and video, and text excerpts for code.
 * Videos play a short silent clip in the preview, so you can tell which one it is.
+* New downloads and saved files are findable within a second, no admin needed.
 * Live index updates through the NTFS change journal when running as admin.
 * Tray icon, single-instance handling, and a config file.
 
@@ -143,6 +144,7 @@ file automatically, so the file always shows everything available.
 | `tray` | `true` | Notification area icon |
 | `elevate` | `true` | Ask for administrator at startup |
 | `watch` | `true` | Live index updates via the NTFS change journal |
+| `live_folders` | `true` | Watch Downloads, Desktop and the rest for new files. A list of paths watches those instead |
 | `watch_quiet_seconds` | `6` | Settle time before rebuilding after changes |
 | `min_rebuild_seconds` | `90` | Minimum gap between rebuilds |
 | `refresh_after_hours` | `12` | Rebuild a cached index older than this |
@@ -228,6 +230,7 @@ on-disk cache is 53 MB.
 | `qf/ui.py` | Tk overlay, DPI scaling, rows, preview pane |
 | `qf/shellicon.py` | Shell icons and thumbnails, encoded to PNG for Tk |
 | `qf/videopreview.py` | Silent video frames decoded with Media Foundation |
+| `qf/freshwatch.py` | Watches the folders files land in, no privileges needed |
 | `qf/usage.py` | Frecency store of what you opened and how recently |
 | `qf/hotkey.py` | `RegisterHotKey` on its own message loop |
 | `qf/tray.py` | `Shell_NotifyIcon` with a message-only window |
@@ -286,6 +289,41 @@ on the standard library.
 When the shell has no real thumbnail it offers a generic page glyph. Requesting
 `SIIGBF_THUMBNAILONLY` first tells the two apart, so a source file shows its
 code rather than a blank page.
+
+### Files that arrive after the index is built
+
+The index is a snapshot, so a file downloaded a minute ago used to be
+unfindable until the next rebuild. The NTFS change journal reports that kind of
+change, but reading it needs administrator rights, which most sessions do not
+have.
+
+`ReadDirectoryChangesW` needs no privileges, so QuickFind watches the folders
+files actually land in: Downloads, Desktop, Documents, Pictures, Videos and
+Music. It blocks until something happens, so an idle machine costs nothing, and
+a created file is reported in about five milliseconds.
+
+Those files are not inserted into the main index. Adding one entry means
+rebuilding the 15 MB search haystack, which costs 600 ms, and rebuilding the
+index itself costs far more. Instead they go into a second tiny index that is
+searched alongside the first and merged into the results:
+
+* The merge inserts by score rather than re-sorting, so the interleaving that
+  keeps identically named files from crowding each other out survives.
+* Anything already in the main index is dropped from the merge, so a file never
+  appears twice.
+* A rebuild clears the list, except for files noticed while it was running,
+  which the new index cannot contain.
+
+The watcher thread stats each file so the UI thread does not have to. That is
+what makes the small index cheap to rebuild: 3000 files take about 10 ms
+instead of 178 ms, which is why a query can rebuild it outright instead of
+waiting for a timer. The list is capped at 3000 files, oldest dropped first.
+Partly downloaded files, which browsers write as `.crdownload` or `.part` and
+rename when they finish, are skipped, since the rename arrives as its own
+event. `:status` reports how many files are being carried this way.
+
+Measured end to end: a file written into Downloads was searchable 50 ms later
+and ranked first.
 
 ### Video previews
 
@@ -388,7 +426,7 @@ hold on any machine.
 ## Development
 
 ```sh
-python -m unittest discover -s tests     # 326 tests
+python -m unittest discover -s tests     # 370 tests
 python quickfind.py --bench report       # time a query
 python quickfind.py --selftest-mft       # verify MFT enumeration (needs admin)
 ```
@@ -456,9 +494,12 @@ fixes that actually worked were removing the false signals ahead of it.
 ## Limitations
 
 * Matches names, not file contents.
-* The index is a snapshot. With live updates it lags by seconds. Without them it
-  lags until the next rebuild. Opening a file that has been deleted reports the
+* The index is a snapshot. New files in the watched folders show up within a
+  second, and with the change journal the whole volume does. Everything else
+  waits for the next rebuild. Opening a file that has been deleted reports the
   problem rather than failing silently.
+* Deletions elsewhere are not noticed until a rebuild, so a file deleted from a
+  folder QuickFind does not watch stays listed until then.
 * Very generic queries can miss the best match, because the candidate pool is
   capped.
 * MFT enumeration reports one name per file, so hardlinked files outside the
