@@ -59,7 +59,9 @@ Undo that with `--uninstall-task`.
 | Mouse hover | Selects the row under the cursor |
 | `Enter` | Open the selection |
 | `Ctrl+Enter` | Show it in Explorer |
-| `Esc` | Dismiss |
+| `Ctrl+Space` | Read a PDF in the window |
+| `Left` / `Right` | Turn the page, while reading |
+| `Esc` | Back to the list, then dismiss |
 
 Clicking away also dismisses it. The preview pane follows the selection, and a
 selected video shows its thumbnail for about half a second and then plays a
@@ -67,6 +69,12 @@ silent preview.
 
 It opens as a single empty field reading `Search anything`, and grows a list
 and a preview pane only once there is something to show.
+
+`Ctrl+Space` on a PDF puts the page in the window instead of the side pane,
+which is the difference between knowing it is a document and being able to read
+it: the pane is 234 px across and body text wants something near a real page
+width. The window takes the page's shape while it is up, `Left` and `Right`
+turn the pages, and `Esc` -- or typing anything -- gives the list back.
 
 Each row ends with what the thing actually is: `App`, `Installer`, `Shortcut`,
 `Folder`, `Video`, `PDF` and so on. Searching for a media player turns up its
@@ -401,6 +409,21 @@ out of ctypes, and a render takes about a tenth of a second.
 All 25 render, in a median of 89 ms and 147 ms at p90, on the worker thread
 like every other preview. The page count goes into the details line, since the
 picture is page one of however many.
+
+**Reading it, rather than recognising it.** A thumbnail in a 234 px pane tells
+you the file is a document; it does not let you read one. `Ctrl+Space` gives
+the page the whole window instead, and `Left` and `Right` turn the pages. This
+costs nothing to render: measured across a dozen real documents, a page at
+900 px took 86 ms against 75 ms at 234 px, because almost all of the time goes
+on opening and parsing the file rather than rasterising it. So the expanded
+view asks for a page as large as the work area allows and the window takes the
+page's shape while it is up -- a portrait page in a window sized for a results
+list is a column of paper with a third of the window empty either side.
+
+Each turn re-opens the document, which is why a page costs 73 ms rather than
+the 10 ms it would if the handle were kept. Keeping WinRT objects alive across
+turns would mean owning their lifetime on the worker thread; at 73 ms a turn
+this has not been worth it.
 
 Two things worth knowing if you touch it:
 

@@ -38,6 +38,7 @@ DEBOUNCE_MS = 45
 CORNER_RADIUS = 22
 
 SPI_GETWHEELSCROLLLINES = 0x0068
+SPI_GETWORKAREA = 0x0030
 WHEEL_PAGESCROLL = 0xFFFFFFFF
 DEFAULT_WHEEL_LINES = 3
 MAX_WHEEL_LINES = 24
@@ -64,7 +65,26 @@ PREVIEW_THUMB = 132
 # the picture: measured, 160 is the tallest page that still leaves room for
 # them, even when a long filename wraps onto two lines.
 PREVIEW_PAGE = 150
+# The pane's floor, so it still has a shape when a search returns two rows.
+# A PDF's details run to four lines -- type, size, date and page count -- and
+# measured, that ran 25px past the old floor of 250 and clipped the page
+# count off the bottom.
+PREVIEW_MIN_HEIGHT = 280
 ICON_PUMP_MS = 50
+
+# The expanded page view. A page is worth expanding only if it becomes
+# readable, and the side pane cannot manage that: it is 234 logical px across
+# and body text wants something near a real page width. Expanded, the page gets
+# the whole window. Rendering big costs no more than rendering small -- 86ms
+# against 75ms, measured -- because the time goes on opening the file.
+PAGE_MARGIN = 12
+# A page sits higher than the search box does and leaves this much of the work
+# area clear above and below it, so a tall page gets as much height as there is
+# without ever running under the taskbar.
+PAGE_TOP = 0.05
+# The window around a page: the search box above it and the page numbers below.
+# Measured at 200% on a 2560x1440 display, 191 device px, so ~96 logical.
+PAGE_CHROME = 100
 # A short silent clip, decoded on the worker and cycled as images.
 # Six runs of eighteen frames, sampled across the clip: five and a half seconds
 # of playback showing six different moments rather than a second and a half of
@@ -189,6 +209,28 @@ FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x00040000
 FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
 CLOUD_ONLY = (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN
               | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+def work_area(fallback):
+    """The screen minus the taskbar, as ``(top, height)``.
+
+    A full page is tall enough that the difference matters: sized against the
+    whole screen it ends up underneath the taskbar.
+    """
+    rect = _RECT()
+    try:
+        ok = ctypes.windll.user32.SystemParametersInfoW(
+            SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)
+    except Exception:
+        return 0, fallback
+    if not ok or rect.bottom <= rect.top:
+        return 0, fallback
+    return rect.top, rect.bottom - rect.top
 
 
 def wheel_lines() -> int:
@@ -337,6 +379,12 @@ class Launcher:
         self._deep_done: queue.Queue = queue.Queue()
         self._deep_worker = None
         self._deep_seq = 0
+        # The expanded page view: the PDF being read, or None.
+        self._page_path = None
+        self._page_index = 0
+        self._page_count = 0
+        self._page_token = 0
+        self._page_image = None
         self._preview_token = 0
         self._preview_image = None
         self._video_frames = []
@@ -388,6 +436,7 @@ class Launcher:
 
         outer = tk.Frame(self.root, bg=BG, bd=0)
         outer.pack(fill="both", expand=True, padx=self.px(1), pady=self.px(1))
+        self._outer = outer
 
         topbar = tk.Frame(outer, bg=BG)
         topbar.pack(fill="x", padx=self.px(14), pady=(self.px(11), self.px(10)))
@@ -426,6 +475,7 @@ class Launcher:
 
         self._build_tree()
         self._build_preview()
+        self._build_page_view()
 
         self.status = tk.Label(outer, font=status_font, bg=BG, fg=DIM, anchor="w")
 
@@ -434,7 +484,10 @@ class Launcher:
         # Bound on the toplevel, not the entry: clicking a row moves focus to
         # the tree, and entry-scoped bindings would stop firing there -- which
         # is why Escape and Enter appeared to stop working after a click.
-        self.root.bind("<Escape>", lambda e: (self.hide(), "break")[1])
+        self.root.bind("<Escape>", self._on_escape)
+        self.root.bind("<Control-space>", self._toggle_page_view)
+        self.root.bind("<Left>", self._on_page_back)
+        self.root.bind("<Right>", self._on_page_forward)
         self.root.bind("<Return>", self._on_return)
         self.root.bind("<KP_Enter>", self._on_return)
         self.root.bind("<Control-Return>", self._on_reveal)
@@ -495,12 +548,22 @@ class Launcher:
 
         self._blank = tk.PhotoImage(width=1, height=1)
 
+    def _build_page_view(self) -> None:
+        """A rendered page filling the window, in place of the results list."""
+        self.page_view = tk.Frame(self._outer, bg=PANEL_BG)
+        self.page_label = tk.Label(self.page_view, bg=PANEL_BG, bd=0)
+        self.page_label.pack(expand=True)
+        self.page_foot = tk.Label(self.page_view, bg=PANEL_BG, fg=DIM,
+                                  font=self.meta_font, anchor="center")
+        self.page_foot.pack(fill="x", pady=(self.px(4), self.px(10)))
+
     def _build_preview(self) -> None:
         self.preview_rule = tk.Frame(self.body, bg=BORDER, width=1)
         # An explicit height gives the pane a floor, so the excerpt still has
         # room when a search returns only two or three rows.
         self.preview = tk.Frame(self.body, bg=PANEL_BG,
-                                width=self.preview_width, height=self.px(250))
+                                width=self.preview_width,
+                                height=self.px(PREVIEW_MIN_HEIGHT))
         self.preview.pack_propagate(False)
 
         self.preview_image_label = tk.Label(self.preview, bg=PANEL_BG, bd=0)
@@ -611,14 +674,27 @@ class Launcher:
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
         height = self.root.winfo_reqheight()
-        x = (screen_w - self.width) // 2
-        y = max(self.px(48), int(screen_h * 0.18)) + self._anim_offset
-        self.root.geometry(f"{self.width}x{height}+{x}+{y}")
+        width = self._window_width()
+        x = (screen_w - width) // 2
+        if self._page_path is not None:
+            top, usable = work_area(screen_h)
+            y = top + max(self.px(24), int(usable * PAGE_TOP))
+            # Whatever the page turned out to be, it stays on the screen.
+            y = min(y, max(top, top + usable - height - self.px(12)))
+        else:
+            y = max(self.px(48), int(screen_h * 0.18))
+        y += self._anim_offset
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
         self.root.update_idletasks()
         self._round_corners()
 
     def _sync_panels(self) -> None:
         """Show the results and preview only when they have something to say."""
+        if self._page_path is not None:
+            # A page is open: the list and the status line are not on screen,
+            # and repacking them here would shove it aside.
+            self._position()
+            return
         if self.results:
             if not self.separator.winfo_ismapped():
                 self.separator.pack(fill="x")
@@ -775,6 +851,12 @@ class Launcher:
                     data, _type = self._icons.png_for(path, is_dir,
                                                       self.large_icons)
                     self._done.put(("icon", key, data))
+                elif kind == "page":
+                    _, token, path, index, box = job
+                    if token != self._page_token:
+                        continue
+                    png, count = pdfpreview.render_page(path, index, box=box)
+                    self._done.put(("page", token, png, count))
                 elif kind == "preview":
                     _, token, path, is_dir = job
                     self._done.put(("preview", token, self._build_preview_data(
@@ -836,6 +918,146 @@ class Launcher:
                         and not cloud_only,
         }
 
+    # -- the expanded page view --------------------------------------------
+
+    def _page_box(self) -> tuple:
+        """How large a page may be drawn, in device pixels."""
+        _top, usable = work_area(self.root.winfo_screenheight())
+        margin = max(self.px(24), int(usable * PAGE_TOP))
+        height = usable - 2 * margin - self.px(PAGE_CHROME)
+        width = self.width - self.px(PAGE_MARGIN * 2)
+        return max(80, width), max(80, height)
+
+    def _window_width(self) -> int:
+        """A page gets a window its own shape rather than the list's.
+
+        A portrait page in a window sized for a results list is a column of
+        paper with a third of the window empty either side of it.
+        """
+        if self._page_path is not None and self._page_image is not None:
+            wanted = (self._page_image.width() + self.px(PAGE_MARGIN * 2)
+                      + self.px(2))
+            return max(self.px(MIN_WIDTH), min(self.width, wanted))
+        return self.width
+
+    def _pdf_at_cursor(self):
+        index = self._selected()
+        if index < 0:
+            return None
+        path = self.results[index].path
+        return path if pdfpreview.is_pdf(path) else None
+
+    def _toggle_page_view(self, _event=None) -> str:
+        if self._page_path is not None:
+            self._close_page_view()
+            return "break"
+        path = self._pdf_at_cursor()
+        if path is not None:
+            self._open_page_view(path)
+        return "break"
+
+    def _open_page_view(self, path: str) -> None:
+        # A clip playing behind the page would go on decoding for nothing.
+        self._stop_video()
+        self._page_path = path
+        self._page_index = 0
+        self._page_count = 0
+        self._page_image = None
+        self.body.pack_forget()
+        self.status.pack_forget()
+        self.separator.pack(fill="x")
+        self.page_view.pack(fill="both", expand=True,
+                            padx=self.px(PAGE_MARGIN),
+                            pady=(self.px(PAGE_MARGIN), 0))
+        self.page_label.configure(image="", text="Opening" + ELLIPSIS, fg=DIM,
+                                  font=self.meta_font)
+        self._show_page_foot()
+        self._position()
+        self._request_page()
+
+    def _close_page_view(self) -> None:
+        if self._page_path is None:
+            return
+        self._page_path = None
+        self._page_image = None
+        # Anything still rendering is for a page nobody is looking at.
+        self._page_token += 1
+        self.page_view.pack_forget()
+        self.page_label.configure(image="", text="")
+        # `_sync_panels` reads the separator as "the panels are already up", so
+        # leaving it packed would keep it from bringing the list back.
+        self.separator.pack_forget()
+        self._sync_panels()
+        # The list was left alone while the page was up, but the preview pane
+        # stopped at whatever it was showing: put it back on the selection.
+        self._schedule_preview()
+
+    def _turn_page(self, step: int) -> None:
+        if self._page_path is None or self._page_count <= 1:
+            return
+        target = self._page_index + step
+        if not 0 <= target < self._page_count:
+            return
+        self._page_index = target
+        self._show_page_foot()
+        self._request_page()
+
+    def _on_page_back(self, _event=None):
+        if self._page_path is None:
+            return None
+        self._turn_page(-1)
+        return "break"
+
+    def _on_page_forward(self, _event=None):
+        if self._page_path is None:
+            return None
+        self._turn_page(1)
+        return "break"
+
+    def _on_escape(self, _event=None) -> str:
+        # Escape backs out one step at a time: out of the page, then out of
+        # the launcher.
+        if self._page_path is not None:
+            self._close_page_view()
+        else:
+            self.hide()
+        return "break"
+
+    def _show_page_foot(self) -> None:
+        if self._page_count > 1:
+            where = "{} of {}".format(self._page_index + 1, self._page_count)
+            keys = "\u2190 \u2192 pages     Esc back"
+        else:
+            where = ""
+            keys = "Esc back"
+        self.page_foot.configure(
+            text="{}     {}".format(where, keys) if where else keys)
+
+    def _request_page(self) -> None:
+        self._page_token += 1
+        self._ensure_worker()
+        self._jobs.put(("page", self._page_token, self._page_path,
+                        self._page_index, self._page_box()))
+
+    def _show_page(self, png, count: int) -> None:
+        self._page_count = count
+        if png is None:
+            self._page_image = None
+            self.page_label.configure(
+                image="", fg=DIM, font=self.meta_font,
+                text="This page cannot be shown")
+        else:
+            try:
+                image = tk.PhotoImage(data=png)
+            except tk.TclError:
+                return
+            # Held on the launcher: Tk keeps only a weak reference and would
+            # otherwise collect it and draw nothing.
+            self._page_image = image
+            self.page_label.configure(image=image, text="")
+        self._show_page_foot()
+        self._position()
+
     def _pump(self) -> None:
         """Drain finished shell work on the UI thread, where Tk is safe."""
         self._pump_id = None
@@ -853,6 +1075,10 @@ class Launcher:
                         except tk.TclError:
                             continue
                         self._apply_icon(key)
+                elif kind == "page":
+                    token, png, count = payload
+                    if token == self._page_token:
+                        self._show_page(png, count)
                 elif kind == "preview":
                     token, info = payload
                     if token == self._preview_token:
@@ -1203,6 +1429,7 @@ class Launcher:
                     pass
                 setattr(self, attr, None)
         self._stop_video()
+        self._close_page_view()
         self._anim_offset = 0
         if was_visible:
             self._fade_out()
@@ -1286,6 +1513,9 @@ class Launcher:
         self._sync_placeholder()
         if event.keysym in ("Up", "Down", "Return", "Escape", "Prior", "Next"):
             return
+        # Typing means the search has moved on, and the list is what answers
+        # it: put the page away rather than searching behind it.
+        self._close_page_view()
         if self._after_id is not None:
             self.root.after_cancel(self._after_id)
         if self._deepen_id is not None:
@@ -1546,6 +1776,10 @@ class Launcher:
         self._top = max(0, min(self._max_top(), self._top))
 
     def _move(self, delta: int) -> str:
+        if self._page_path is not None:
+            # The list is behind a page. Moving a selection nobody can see
+            # would change what Enter opens without showing why.
+            return "break"
         if not self.results:
             return "break"
         current = self._selected()
