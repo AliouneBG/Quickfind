@@ -14,7 +14,7 @@ library, so there is nothing to install, no virtualenv, and no build step.
 * Ranking that prefers apps, your own files, and things you have opened before.
 * Windows shell icons on every row.
 * Preview pane with thumbnails for images and video, and text excerpts for code.
-* Videos play a silent six second preview sampled from across the clip.
+* Videos play a silent preview at 20fps, sampled from across the clip.
 * New downloads and saved files are findable within a second, no admin needed.
 * Live index updates through the NTFS change journal when running as admin.
 * Tray icon, single-instance handling, and a config file.
@@ -330,15 +330,15 @@ and ranked first.
 A single frame often cannot tell two recordings apart, so selecting a video
 plays a silent preview in the pane. Tk has no video widget, so
 `qf/videopreview.py` decodes real frames with Media Foundation and the UI
-cycles them at 12 frames per second. Only the video stream is read, so there is
+cycles them at 20 frames per second. Only the video stream is read, so there is
 no audio to mute.
 
-The preview is six runs of twelve frames rather than one continuous stretch:
-six seconds of playback showing six different moments. One continuous second
-tells you about one moment, and on a static shot it is indistinguishable from
-the thumbnail. Measured on ten of the machine's own videos, consecutive frames
-in a single run differed by 5.8 on a 0 to 255 scale, while the openings of the
-six runs differed by 58.
+The preview is six runs of eighteen frames rather than one continuous stretch:
+five and a half seconds of playback showing six different moments. One
+continuous second tells you about one moment, and on a static shot it is
+indistinguishable from the thumbnail. Measured on ten of the machine's own
+videos, consecutive frames in a single run differed by 5.8 on a 0 to 255 scale,
+while the openings of the six runs differed by 58.
 
 Where those runs come from matters as much as how many there are. Sampling is
 trimmed to between 12% and 90% of the duration, which drops title cards and
@@ -358,23 +358,42 @@ Four decisions keep it fast enough to run on a hover:
   bounded, because on a long group of pictures it consumed the whole read
   budget and returned nothing.
 * **Runs are handed over as they finish.** The preview starts playing after the
-  first run, about 700 ms in, and lengthens as the rest arrive. Nobody waits
+  first run, about 800 ms in, and lengthens as the rest arrive. Nobody waits
   for the full decode.
 * **Stale work is abandoned, not decoded.** A full preview costs a few seconds,
   so sweeping down a list of videos would queue one decode per row. The worker
   skips jobs whose selection has already moved on, and a decode in progress
   stops at the next run boundary when the selection changes.
 
+### Keeping playback smooth
+
+Two things were quietly stealing frames.
+
+**Windows rounds every timer up to its 15.6 ms tick.** Asking for a frame every
+83 ms therefore waited about 95 ms, and a nominal 12 fps animation actually ran
+at 10.7 fps with visible jitter. While a clip is playing, QuickFind asks Windows
+for 1 ms timers with `timeBeginPeriod` and hands them straight back when it
+stops, and each frame is scheduled against a fixed clock rather than by adding a
+constant delay, so the time a frame itself takes is not lost. Measured in the
+real window: 20.0 fps with 3 ms of jitter, against 10.7 fps before.
+
+**Turning a decoded run into Tk images stalled the animation.** A PNG becomes a
+`PhotoImage` in about 10 ms, so converting a whole run at once froze playback
+for a fifth of a second every time one arrived. Frames are now converted one per
+displayed frame, which still outruns the decoder. That alone took the worst gap
+between frames from 215 ms to 63 ms.
+
+A complete preview holds around a hundred `PhotoImage` objects, about 50 MB
+inside Tk, all of it released the moment the selection moves.
+
 Opening frames that are a flat colour are passed over, so a video that starts on
-a black card does not preview as a black rectangle. Decoding stops after six
+a black card does not preview as a black rectangle. Decoding stops after eight
 seconds and animates whatever arrived, and a file Media Foundation cannot open
 simply keeps its still thumbnail.
 
 Across a 24 video sample on the development machine, motion appeared after a
-median of 688 ms, the full six run preview took a median of 3.4 seconds, and
-all of it runs on the worker thread with the still thumbnail already on screen.
-A complete preview holds 72 frames, about 25 MB inside Tk, released as soon as
-the selection moves.
+median of 802 ms and the full six run preview took a median of 4.3 seconds, all
+of it on the worker thread with the still thumbnail already on screen.
 
 ### How search stays fast
 
@@ -445,7 +464,7 @@ hold on any machine.
 ## Development
 
 ```sh
-python -m unittest discover -s tests     # 388 tests
+python -m unittest discover -s tests     # 396 tests
 python quickfind.py --bench report       # time a query
 python quickfind.py --selftest-mft       # verify MFT enumeration (needs admin)
 ```

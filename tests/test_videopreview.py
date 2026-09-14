@@ -5,6 +5,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import zlib
 from unittest import mock
@@ -371,6 +372,45 @@ class TestPlayback(unittest.TestCase):
             self.app._advance_video()
         self.assertTrue(self.app._video_frames, "looping must not empty the list")
 
+    def test_the_frame_clock_asks_for_one_interval(self):
+        self.app._video_start = time.monotonic()
+        self.app._video_index = 1
+        delay = self.app._next_delay()
+        self.assertAlmostEqual(delay, 1000 / ui.VIDEO_FPS, delta=4)
+
+    def test_a_late_frame_shortens_the_next_wait(self):
+        # The whole point: a constant delay after a slow frame loses time
+        # every tick, which is what held a nominal 12fps loop to 10.7fps.
+        interval = 1.0 / ui.VIDEO_FPS
+        self.app._video_start = time.monotonic() - interval * 1.5
+        self.app._video_index = 1
+        self.assertLess(self.app._next_delay(), 1000 / ui.VIDEO_FPS)
+
+    def test_the_wait_is_never_zero(self):
+        self.app._video_start = time.monotonic() - 60
+        self.app._video_index = 1
+        self.assertGreaterEqual(self.app._next_delay(), 1)
+
+    def test_playing_asks_for_a_finer_system_timer(self):
+        self.app.show()
+        self.app._start_video(self.frames)
+        self.assertTrue(self.app._fine_timer)
+
+    def test_stopping_gives_the_timer_back(self):
+        self.app.show()
+        self.app._start_video(self.frames)
+        self.app._stop_video()
+        self.assertFalse(self.app._fine_timer)
+
+    def test_a_longer_clip_does_not_ask_twice(self):
+        # timeBeginPeriod and timeEndPeriod are counted, so a second run
+        # arriving must not add another outstanding request.
+        self.app.show()
+        self.app._start_video(self.frames)
+        self.app._extend_video(self.frames)
+        self.app._stop_video()
+        self.assertFalse(self.app._fine_timer)
+
     def test_stopping_releases_the_frames(self):
         self.app.show()
         self.app._start_video(self.frames)
@@ -482,9 +522,35 @@ class TestPlayback(unittest.TestCase):
         self.app._start_video(self.frames)
         first = self.app._video_id
         self.app._extend_video(self.frames)
-        self.assertEqual(len(self.app._video_frames), len(self.frames) * 2)
         self.assertEqual(self.app._video_id, first,
                          "playback should not restart when a run is added")
+        for _ in range(len(self.frames)):
+            self.app._advance_video()
+        self.assertEqual(len(self.app._video_frames), len(self.frames) * 2)
+        self.assertEqual(self.app._video_pending, [])
+
+    def test_a_later_run_is_converted_over_several_frames(self):
+        # Converting a whole run at once cost 180ms on the UI thread, which
+        # showed as a hitch in the animation every time a run landed.
+        self.app.show()
+        self.app._start_video(self.frames)
+        before = len(self.app._video_frames)
+        self.app._extend_video(self.frames * 4)
+        self.assertEqual(len(self.app._video_frames), before,
+                         "nothing should be converted on arrival")
+        self.app._advance_video()
+        self.assertEqual(len(self.app._video_frames),
+                         before + ui.VIDEO_CONVERT_PER_TICK)
+
+    def test_playback_starts_on_the_opening_frames_alone(self):
+        # Motion should start as soon as a few frames exist, not once the
+        # whole run has been converted.
+        self.app.show()
+        self.app._extend_video(self.frames * 5)
+        self.assertIsNotNone(self.app._video_id, "playback did not start")
+        self.assertLessEqual(len(self.app._video_frames),
+                             ui.VIDEO_OPENING_FRAMES + ui.VIDEO_CONVERT_PER_TICK)
+        self.assertTrue(self.app._video_pending, "the rest should still wait")
 
     def test_the_first_run_starts_playback(self):
         self.app.show()

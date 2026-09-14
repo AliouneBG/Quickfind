@@ -40,11 +40,11 @@ VIDEO_EXTENSIONS = frozenset(
 
 # A preview is several short runs from across the clip rather than one long
 # one: one continuous second tells you about one moment, six spread through
-# the film tell you what it is. Defaults are 6 runs of 9 frames at 12fps,
-# about 4.5 seconds of playback.
+# the film tell you what it is. Defaults are 6 runs of 18 frames at 20fps,
+# about five and a half seconds of playback.
 DEFAULT_SEGMENTS = 6
-DEFAULT_PER_SEGMENT = 12
-DEFAULT_FPS = 12.0
+DEFAULT_PER_SEGMENT = 18
+DEFAULT_FPS = 20.0
 # A clip barely longer than the preview is better shown straight through than
 # chopped into runs with gaps between them.
 SHORT_CLIP_FACTOR = 1.5
@@ -226,10 +226,11 @@ def segments(path, size=(240, 135), count=DEFAULT_SEGMENTS,
             ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
         if mfplat.MFCreateAttributes(ctypes.byref(attributes), 1) != 0:
             return 0, 0, []
-        _method(attributes, AT_SET_UINT32, ctypes.c_long,
-                ctypes.POINTER(GUID), ctypes.c_uint)(
-            attributes,
-            ctypes.byref(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING), 1)
+        set_uint = _method(attributes, AT_SET_UINT32, ctypes.c_long,
+                           ctypes.POINTER(GUID), ctypes.c_uint)
+        set_uint(attributes,
+                 ctypes.byref(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING),
+                 1)
 
         mfreadwrite.MFCreateSourceReaderFromURL.argtypes = [
             wintypes.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
