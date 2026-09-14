@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -226,14 +227,22 @@ class TestViewport(unittest.TestCase):
         self.assertEqual(app.tree.selection(), ())
 
     def test_hovering_picks_the_result_under_the_pointer(self):
+        # The row Tk reports is an offset into the viewport, so it has to be
+        # read as `top + row` rather than as a result index.
         app = self.launcher(self.rows(1000))
         app._scroll_to(300)
-        app.root.update()
-        box = app.tree.bbox(app.tree.get_children()[2])
-        self.assertTrue(box, "the tree was never laid out")
-        app._on_hover(type("Event", (), {"y": box[1] + box[3] // 2})())
+        third_row = app.tree.get_children()[2]
+        with mock.patch.object(app.tree, "identify_row", return_value=third_row):
+            app._on_hover(type("Event", (), {"y": 0})())
         self.assertEqual(app._selected(), 302,
                          "the third row on screen is the 303rd result")
+
+    def test_hovering_past_the_last_row_selects_nothing_new(self):
+        app = self.launcher(self.rows(1000))
+        app._select(7)
+        with mock.patch.object(app.tree, "identify_row", return_value=""):
+            app._on_hover(type("Event", (), {"y": 9999})())
+        self.assertEqual(app._selected(), 7)
 
     # -- a new search ------------------------------------------------------
 

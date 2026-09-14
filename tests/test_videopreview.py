@@ -35,18 +35,16 @@ def available_clips():
     return [p for p in SYSTEM_CLIPS if os.path.exists(p)]
 
 
-def scanlines(png):
-    """Raw filtered rows of a PNG, so pixels can be checked without Tk."""
-    data, offset = b"", 8
-    while offset < len(png):
-        length, kind = struct.unpack(">I4s", png[offset:offset + 8])
-        if kind == b"IDAT":
-            data += png[offset + 8:offset + 8 + length]
-        offset += 12 + length
-    raw = zlib.decompress(data)
-    width, height = struct.unpack(">II", png[16:24])
-    row = width * 4 + 1
-    return [raw[i * row:(i + 1) * row] for i in range(height)]
+def header(ppm):
+    """The size a PPM frame declares."""
+    parts = ppm.split(b"\n", 3)
+    width, height = parts[1].split()
+    return int(width), int(height)
+
+
+def body(ppm):
+    """The raw RGB bytes of a PPM frame, so pixels can be read without Tk."""
+    return ppm.split(b"\n", 3)[3]
 
 
 class TestExtensionCheck(unittest.TestCase):
@@ -82,32 +80,50 @@ class TestAspectFit(unittest.TestCase):
 
 
 class TestPixelConversion(unittest.TestCase):
-    def test_bgra_becomes_rgba(self):
-        # One blue pixel in BGRA is (255, 0, 0, x).
-        png = videopreview._bgra_to_png(bytes([255, 0, 0, 0]), 1, 1, flip=False)
-        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
-        width, height, depth, colour = struct.unpack(">IIBB", png[16:26])
-        self.assertEqual((width, height, depth, colour), (1, 1, 8, 6))
+    """Frames go to Tk as PPM: a tiny header and raw RGB, no compression."""
 
-    def test_padding_channel_becomes_opaque(self):
-        # RGB32's fourth byte is padding and arrives as zero; left alone it
-        # would make every frame fully transparent.
-        png = videopreview._bgra_to_png(bytes([10, 20, 30, 0]), 1, 1, flip=False)
-        # Filter byte, then R, G, B, A.
-        self.assertEqual(list(scanlines(png)[0]), [0, 30, 20, 10, 255])
+    def test_the_header_names_the_size(self):
+        ppm = videopreview._bgra_to_ppm(bytes(4 * 6), 3, 2, flip=False)
+        self.assertEqual(header(ppm), (3, 2))
+
+    def test_bgra_becomes_rgb(self):
+        # One blue pixel in BGRA is (255, 0, 0, padding).
+        ppm = videopreview._bgra_to_ppm(bytes([255, 0, 0, 0]), 1, 1, flip=False)
+        self.assertEqual(list(body(ppm)), [0, 0, 255])
+
+    def test_channels_keep_their_order(self):
+        ppm = videopreview._bgra_to_ppm(bytes([10, 20, 30, 0]), 1, 1, flip=False)
+        self.assertEqual(list(body(ppm)), [30, 20, 10])
+
+    def test_the_padding_byte_is_dropped(self):
+        # RGB32's fourth byte carries nothing; PPM has nowhere to put it.
+        ppm = videopreview._bgra_to_ppm(bytes(4 * 4), 2, 2, flip=False)
+        self.assertEqual(len(body(ppm)), 2 * 2 * 3)
 
     def test_flip_reverses_row_order(self):
         black = bytes([0, 0, 0, 0])
         white = bytes([255, 255, 255, 0])
-        upright = scanlines(videopreview._bgra_to_png(black + white, 1, 2,
-                                                      flip=False))
-        flipped = scanlines(videopreview._bgra_to_png(black + white, 1, 2,
-                                                      flip=True))
-        self.assertEqual(upright, flipped[::-1])
-        self.assertEqual(list(upright[0]), [0, 0, 0, 0, 255])
+        upright = body(videopreview._bgra_to_ppm(black + white, 1, 2, False))
+        flipped = body(videopreview._bgra_to_ppm(black + white, 1, 2, True))
+        self.assertEqual(list(upright), [0, 0, 0, 255, 255, 255])
+        self.assertEqual(list(flipped), [255, 255, 255, 0, 0, 0])
 
     def test_short_buffers_do_not_crash(self):
-        videopreview._bgra_to_png(bytes(4), 4, 4, flip=True)
+        videopreview._bgra_to_ppm(bytes(4), 4, 4, flip=True)
+
+    @unittest.skipUnless(TK_AVAILABLE, "no Tk display available")
+    def test_tk_reads_it(self):
+        root = make(tk.Tk)
+        root.withdraw()
+        try:
+            ppm = videopreview._bgra_to_ppm(bytes([10, 20, 30, 0]) * 6, 3, 2,
+                                            flip=False)
+            image = tk.PhotoImage(data=ppm)
+            self.assertEqual((image.width(), image.height()), (3, 2))
+            self.assertEqual(image.get(0, 0)[:3], (30, 20, 10))
+        finally:
+            root.destroy()
+            gc.collect()
 
 
 class TestSamplePositions(unittest.TestCase):
@@ -283,11 +299,11 @@ class TestDecoding(unittest.TestCase):
         self.assertGreaterEqual(len(pngs), 2)
         self.assertGreater(len(set(pngs)), 1, "frames should show motion")
 
-    def test_every_frame_is_a_valid_png(self):
-        _w, _h, pngs = videopreview.frames(self.clips[0], size=(160, 160),
-                                           count=4, fps=8)
-        for png in pngs:
-            self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+    def test_every_frame_is_an_image_tk_can_read(self):
+        _w, _h, frames = videopreview.frames(self.clips[0], size=(160, 160),
+                                             count=4, fps=8)
+        for frame in frames:
+            self.assertTrue(frame.startswith(b"P6\n"), frame[:8])
 
     def test_output_keeps_the_source_aspect(self):
         for clip in self.clips:
@@ -298,13 +314,12 @@ class TestDecoding(unittest.TestCase):
             self.assertLessEqual(width, 240)
             self.assertLessEqual(height, 240)
 
-    def test_reported_size_matches_the_pngs(self):
-        width, height, pngs = videopreview.frames(self.clips[0],
-                                                  size=(200, 200), count=2)
-        if not pngs:
+    def test_reported_size_matches_the_frames(self):
+        width, height, frames = videopreview.frames(self.clips[0],
+                                                    size=(200, 200), count=2)
+        if not frames:
             self.skipTest("nothing decoded")
-        png_w, png_h = struct.unpack(">II", pngs[0][16:24])
-        self.assertEqual((png_w, png_h), (width, height))
+        self.assertEqual(header(frames[0]), (width, height))
 
     def test_frame_count_is_respected(self):
         _w, _h, pngs = videopreview.frames(self.clips[0], size=(160, 160),
@@ -334,21 +349,22 @@ class TestDecoding(unittest.TestCase):
         handed = []
         _w, _h, runs = videopreview.segments(
             self.clips[0], size=(160, 160), count=3, per_segment=3,
-            on_segment=lambda w, h, pngs: handed.append(pngs))
-        self.assertEqual(len(handed), len(runs))
+            on_segment=lambda w, h, frames: handed.append(frames))
+        self.assertEqual(len(handed), 3)
+        # Handed over rather than kept: a frame is 368KB uncompressed, and
+        # holding the preview here as well as in the caller cost 40MB.
+        self.assertEqual(runs, [])
 
     def test_saying_no_stops_the_decode(self):
         handed = []
 
-        def once(width, height, pngs):
-            handed.append(pngs)
+        def once(width, height, frames):
+            handed.append(frames)
             return False
 
-        _w, _h, runs = videopreview.segments(self.clips[0], size=(160, 160),
-                                             count=5, per_segment=3,
-                                             on_segment=once)
-        self.assertEqual(len(handed), 1)
-        self.assertEqual(len(runs), 1)
+        videopreview.segments(self.clips[0], size=(160, 160), count=5,
+                              per_segment=3, on_segment=once)
+        self.assertEqual(len(handed), 1, "the decode carried on regardless")
 
     def test_frames_within_a_run_actually_move(self):
         # A run of near-identical frames is what made a preview look like it
@@ -702,33 +718,38 @@ class TestPlayback(unittest.TestCase):
                              ui.VIDEO_OPENING_FRAMES + ui.VIDEO_CONVERT_PER_TICK)
         self.assertTrue(self.app._video_pending, "the rest should still wait")
 
-    def test_one_run_is_not_enough_to_start_on(self):
-        """Playing the first run alone catches up with the decoder.
+    def test_the_first_run_is_enough_to_start_on(self):
+        """One run is 0.9s of playback, and decoding now runs ahead of that.
 
-        A run is 0.9s of playback and the next takes about a second to
-        arrive, so the loop reached its end and showed the opening frame
-        again before there was anything new. The still thumbnail stays up
-        until a second run is in hand.
+        It did not always: a run used to take about as long to decode as to
+        play, so the loop reached its end and showed its opening frame again
+        just before the next run landed. Frames now cost 19ms rather than
+        77ms, which is about 2.5 seconds of playback per second of work.
         """
         self.app.show()
         self.app._extend_video(self.frames)
-        self.assertIsNone(self.app._video_id, "started too early")
-        self.assertEqual(self.app._video_frames, [])
-
-    def test_the_second_run_starts_playback(self):
-        self.app.show()
-        self.app._extend_video(self.frames)
-        self.app._extend_video(self.frames)
         self.assertIsNotNone(self.app._video_id)
         self.assertTrue(self.app._video_frames)
+
+    def test_nothing_plays_before_a_run_arrives(self):
+        self.app.show()
+        self.assertIsNone(self.app._video_id)
+        self.assertEqual(self.app._video_frames, [])
+
+    def test_a_later_run_does_not_restart_playback(self):
+        self.app.show()
+        self.app._extend_video(self.frames)
+        first = self.app._video_id
+        self.app._extend_video(self.frames)
+        self.assertEqual(self.app._video_id, first)
 
     def test_a_clip_with_only_one_run_still_plays(self):
         # A short clip yields one run and no second one is ever coming.
         self.app.show()
         self.app._extend_video(self.frames)
-        self.assertIsNone(self.app._video_id)
         self.app._finish_video()
         self.assertIsNotNone(self.app._video_id)
+        self.assertTrue(self.app._video_final)
 
     def test_the_decoder_finishing_with_nothing_starts_nothing(self):
         self.app.show()

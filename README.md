@@ -61,8 +61,8 @@ Undo that with `--uninstall-task`.
 | `Esc` | Dismiss |
 
 Clicking away also dismisses it. The preview pane follows the selection, and a
-selected video holds its thumbnail for a moment and then plays a silent
-preview.
+selected video shows its thumbnail for about half a second and then plays a
+silent preview.
 
 The list holds far more than it shows. Only the rows on screen exist as
 widgets, so a search matching thousands of files scrolls as smoothly as one
@@ -414,14 +414,27 @@ Four decisions keep it fast enough to run on a hover:
   followed by consecutive reads. Running forward to the exact requested time is
   bounded, because on a long group of pictures it consumed the whole read
   budget and returned nothing.
+* **Frames go to Tk as PPM, and the sample is copied with one memcpy.**
+  Slicing the sample pointer instead built a Python list of half a million
+  integers, which cost 43 ms a frame, more than the decode it was waiting on.
+  PNG then cost 6.7 ms to build and 4.4 ms for Tk to load, against 0.9 ms and
+  1.8 ms for uncompressed PPM. Together those took a frame from 77 ms to
+  19 ms, of which 17 ms is now Media Foundation actually decoding.
 * **Runs are handed over as they finish**, and the preview lengthens as they
-  arrive rather than waiting for the whole decode. It does wait for the second
-  one, though, at about two seconds, because a run is 0.9 seconds of playback
-  and the next takes about a second to decode: starting on the first meant the
-  loop reached its end and showed the opening frame again before there was
-  anything new. Two runs in hand leaves 0.65 seconds of slack, and the still
-  thumbnail holds the pane until then. Measured on three clips, the preview
-  then plays all 108 frames before anything repeats.
+  arrive rather than waiting for the whole decode. One run is enough to start
+  on: a run is 0.9 seconds of playback, and decoding now produces about 2.5
+  seconds of playback per second of work, so the loop cannot catch up with the
+  decoder. It could before, when a run took as long to decode as to play, and
+  the preview showed its opening frame again after about a second.
+
+The still thumbnail holds the pane until the first run lands, which measured
+600 ms at the median. Traced on real clips, the preview then plays every
+distinct frame it has before anything repeats, and the first repeat is the loop
+starting over.
+
+A complete preview is around 150 MB while it plays, because Tk keeps both a
+master and a display copy of every frame. It is released the moment the
+selection moves, and `video_preview: false` turns the whole thing off.
 * **Stale work is abandoned, not decoded.** A full preview costs a few seconds,
   so sweeping down a list of videos would queue one decode per row. The worker
   skips jobs whose selection has already moved on, and a decode in progress
@@ -460,9 +473,9 @@ says "Online only, not downloaded" instead of showing an empty box, and text
 excerpts are skipped for the same reason.
 
 Across a 24 video sample on the development machine, the first run was decoded
-after a median of 977 ms and the full six run preview took a median of 4.8
-seconds, all of it on the worker thread with the still thumbnail on screen.
-Motion starts once the second run lands, around two seconds in.
+after a median of 600 ms, which is when motion starts, and the full six run
+preview took a median of 1.9 seconds, all of it on the worker thread with the
+still thumbnail on screen until the first run arrives.
 
 ### Runs that do not move
 
@@ -554,7 +567,7 @@ hold on any machine.
 ## Development
 
 ```sh
-python -m unittest discover -s tests     # 462 tests
+python -m unittest discover -s tests     # 466 tests
 python quickfind.py --bench report       # time a query
 python quickfind.py --selftest-mft       # verify MFT enumeration (needs admin)
 ```

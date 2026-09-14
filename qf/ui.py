@@ -55,19 +55,20 @@ ICON_PUMP_MS = 50
 VIDEO_SEGMENTS = 6
 VIDEO_PER_SEGMENT = 18
 VIDEO_FPS = 20.0
-# Enough of the first run to start on, then one per frame after that. Turning a
-# PNG into a Tk image costs about 10ms, so converting a whole run at once
-# stalled the animation for a fifth of a second every time one arrived. One per
-# tick is 20 a second, which still outruns the decoder, and it measured
-# steadier than two (3.0ms of jitter against 6.7ms).
+# Enough of the first run to start on, then a few per frame after that.
+# Turning a frame into a Tk image costs 1.8ms now that frames arrive as PPM
+# rather than PNG, so three fit comfortably inside a 50ms tick. Converting a
+# whole run at once still would not: that stalled the animation for a fifth of
+# a second every time one landed.
 VIDEO_OPENING_FRAMES = 4
-VIDEO_CONVERT_PER_TICK = 1
-# Runs arrive about a second apart and each is 0.9s of playback, so starting on
-# the first one means the loop reaches its end and shows the opening frame
-# again before there is anything new to show. Holding the still thumbnail until
-# a second run is in hand leaves 0.65s of slack, and the preview then never
-# repeats until the whole clip is decoded, where looping is the point.
-VIDEO_BUFFER_RUNS = 2
+VIDEO_CONVERT_PER_TICK = 3
+# How many runs to have in hand before playing. A run is 0.9s of playback and
+# used to take about as long to decode, so one run of buffer sat exactly on the
+# edge: the loop reached its end and showed the opening frame again just before
+# the next run landed. Decoding is four times quicker per frame now and
+# produces roughly 2.5 seconds of playback per second of work, so one run is
+# enough and the thumbnail gives way in about half a second rather than two.
+VIDEO_BUFFER_RUNS = 1
 VIDEO_BOX = 190          # logical px; the pane is 250 wide
 
 # Fonts are given in pixels (negative sizes). Point sizes would be multiplied by

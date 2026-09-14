@@ -20,7 +20,6 @@ import os
 import time
 from ctypes import wintypes
 
-from .shellicon import encode_png
 
 mfplat = ctypes.WinDLL("mfplat")
 mfreadwrite = ctypes.WinDLL("mfreadwrite")
@@ -180,17 +179,30 @@ def _difference(a: bytes, b: bytes) -> float:
     return sum(abs(x - y) for x, y in zip(a, b)) / n
 
 
-def _bgra_to_png(raw: bytes, width: int, height: int, flip: bool) -> bytes:
-    """Media Foundation hands back BGRA; PNG wants RGBA."""
+def _bgra_to_ppm(raw: bytes, width: int, height: int, flip: bool) -> bytes:
+    """Media Foundation hands back BGRA; Tk reads PPM without any decoding.
+
+    PNG costs 6.7ms to build and 4.4ms for Tk to load, against 0.9ms and 1.8ms
+    for uncompressed PPM. That is eight milliseconds a frame on a path that
+    runs a hundred times per preview, and it is what lets the preview start
+    playing in half a second rather than two. The frames are opaque, so the
+    alpha channel PNG was carrying was never worth anything either.
+    """
     stride = width * 4
-    pixels = bytearray(raw[:stride * height])
-    pixels[0::4], pixels[2::4] = pixels[2::4], pixels[0::4]
-    # The fourth channel of RGB32 is padding, not alpha, and arrives as zeroes.
-    pixels[3::4] = b"\xff" * (len(pixels) // 4)
+    needed = stride * height
+    data = raw[:needed]
+    if len(data) < needed:
+        # A truncated buffer would leave the strided copies below mismatched.
+        # Pad it and let the missing rows come out black.
+        data += bytes(needed - len(data))
     if flip:
-        pixels = b"".join(bytes(pixels[y * stride:(y + 1) * stride])
-                          for y in range(height - 1, -1, -1))
-    return encode_png(width, height, bytes(pixels))
+        data = b"".join(data[y * stride:(y + 1) * stride]
+                        for y in range(height - 1, -1, -1))
+    pixels = bytearray(width * height * 3)
+    pixels[0::3] = data[2::4]
+    pixels[1::3] = data[1::4]
+    pixels[2::3] = data[0::4]
+    return b"P6\n%d %d\n255\n" % (width, height) + bytes(pixels)
 
 
 def positions(duration, count, first=FIRST_FRACTION, last=LAST_FRACTION,
@@ -233,12 +245,18 @@ def segments(path, size=(240, 135), count=DEFAULT_SEGMENTS,
              budget_seconds=DEFAULT_BUDGET_SECONDS, on_segment=None):
     """Decode short runs from several points in the clip.
 
-    Returns ``(width, height, [[png, ...], ...])``, one list per point
-    sampled, and empty when the file cannot be decoded. ``on_segment`` is
-    called with ``(width, height, pngs)`` as each run finishes, so a caller
-    can start showing motion before the rest arrives; returning False from it
-    stops the decode. Safe to call only off the UI thread: it reads and
-    decodes.
+    Returns ``(width, height, [[frame, ...], ...])``, one list per point
+    sampled, each frame a PPM image, and empty when the file cannot be
+    decoded.
+
+    ``on_segment`` is called with ``(width, height, frames)`` as each run
+    finishes, so a caller can start showing motion before the rest arrives;
+    returning False from it stops the decode. Runs handed to it are not also
+    returned, because an uncompressed frame is 368KB and holding a whole
+    preview twice over is 40MB behind a picture already given away, so a
+    caller that passes a callback gets an empty list back.
+
+    Safe to call only off the UI thread: it reads and decodes.
     """
     initialised = ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
     if mfplat.MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET) != 0:
@@ -350,12 +368,16 @@ def segments(path, size=(240, 135), count=DEFAULT_SEGMENTS,
             starts = positions(duration, count, first, last)
         deadline = time.monotonic() + budget_seconds
         for start in starts:
-            pngs = _run(reader, read, start, per_segment, fps,
-                        width, height, flip, deadline)
-            if not pngs:
+            frames = _run(reader, read, start, per_segment, fps,
+                          width, height, flip, deadline)
+            if not frames:
                 break
-            runs.append(pngs)
-            if on_segment is not None and on_segment(width, height, pngs) is False:
+            if on_segment is None:
+                runs.append(frames)
+            # Handed over, so not kept as well: an uncompressed frame is 368KB
+            # and holding a whole preview here on top of the caller's copy put
+            # 40MB behind a picture that had already been given away.
+            elif on_segment(width, height, frames) is False:
                 break
             if time.monotonic() > deadline:
                 break
@@ -438,7 +460,7 @@ def _run(reader, read, start, count, fps, width, height, flip, deadline):
             still_step = 1.0
             previous = current
             next_wanted = seconds + interval
-            out.append(_bgra_to_png(raw, width, height, flip))
+            out.append(_bgra_to_ppm(raw, width, height, flip))
         finally:
             _release(sample)
     return out
@@ -513,7 +535,11 @@ def _sample_bytes(sample):
                 buffer, ctypes.byref(data), None, ctypes.byref(length)) != 0:
             return None
         try:
-            return bytes(bytearray(data[:length.value]))
+            # string_at is a memcpy. Slicing the pointer instead builds a
+            # Python list of half a million integers and then walks it again,
+            # which measured 43ms a frame against 0.2ms here: more than the
+            # decode it was waiting on.
+            return ctypes.string_at(data, length.value)
         finally:
             _method(buffer, BUF_UNLOCK, ctypes.c_long)(buffer)
     finally:
