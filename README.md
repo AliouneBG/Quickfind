@@ -65,6 +65,9 @@ Clicking away also dismisses it. The preview pane follows the selection, and a
 selected video shows its thumbnail for about half a second and then plays a
 silent preview.
 
+It opens as a single empty field reading `Search anything`, and grows a list
+and a preview pane only once there is something to show.
+
 Each row ends with what the thing actually is: `App`, `Installer`, `Shortcut`,
 `Folder`, `Video`, `PDF` and so on. Searching for a media player turns up its
 folder, its logo, its installer, its uninstaller and the program itself, all
@@ -274,6 +277,32 @@ Two measured reasons, both worth knowing before simplifying this:
    filename holding an emoji promoted the entire 15 million character haystack
    to 4 bytes per character, costing 60.5 MB instead of 15 MB. Exactly one such
    file existed on the test machine. `bytes` has no such cliff.
+
+### The window itself
+
+A borderless Tk window with no title bar, rounded off with `SetWindowRgn` and a
+22 px radius, one pixel of border showing through from the root behind it. Tk
+paints an opaque client area over the composition layer, so real acrylic blur is
+not reachable; what looks translucent is flat alpha at 0.92, which `opacity` in
+config.json tunes.
+
+Opening and closing are driven by the clock rather than by counting frames.
+Counting frames at a nominal 12 ms produced a 182 ms open in gaps of 20 ms,
+because Windows rounds every timer up to its 15.6 ms tick -- the same tax the
+video preview pays. The launcher now holds a 1 ms timer while it animates and
+asks for the elapsed fraction of 150 ms, so a late frame shortens the steps that
+remain instead of stretching the whole animation. Measured: 12 frames over
+159 ms, a median gap of 12 ms against 20 ms before, and jitter down from 6.6 ms
+to 3.9 ms. The request for the finer timer is counted, not flagged, because
+playback may want it at the same moment.
+
+Opacity and position ease on different curves, because they are doing different
+jobs. The window rises 14 px into place and decelerates; the opacity rises
+evenly. Sharing one ease-out curve put the window at 40 percent opacity on the
+first painted frame and then spent the rest of the animation on the last eight
+percent. Dismissing takes 90 ms and sinks 6 px back the way it came: long
+enough to read as a fade rather than a blink, short enough that Escape still
+feels instant.
 
 ### Drawing the list
 

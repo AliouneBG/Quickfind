@@ -546,13 +546,13 @@ class TestPlayback(unittest.TestCase):
     def test_playing_asks_for_a_finer_system_timer(self):
         self.app.show()
         self.app._start_video(self.frames)
-        self.assertTrue(self.app._fine_timer)
+        self.assertTrue(self.app._video_fine)
 
     def test_stopping_gives_the_timer_back(self):
         self.app.show()
         self.app._start_video(self.frames)
         self.app._stop_video()
-        self.assertFalse(self.app._fine_timer)
+        self.assertFalse(self.app._video_fine)
 
     def test_a_longer_clip_does_not_ask_twice(self):
         # timeBeginPeriod and timeEndPeriod are counted, so a second run
@@ -561,7 +561,11 @@ class TestPlayback(unittest.TestCase):
         self.app._start_video(self.frames)
         self.app._extend_video(self.frames)
         self.app._stop_video()
-        self.assertFalse(self.app._fine_timer)
+        self.assertFalse(self.app._video_fine)
+        # The open animation wants the same timer, so let it finish
+        # first: nothing at all may be left outstanding.
+        self.app._cancel_anim()
+        self.assertEqual(self.app._fine_holds, 0)
 
     def test_stopping_releases_the_frames(self):
         self.app.show()

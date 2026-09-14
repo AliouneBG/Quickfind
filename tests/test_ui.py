@@ -1,6 +1,7 @@
 import gc
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -197,32 +198,114 @@ class TestChrome(unittest.TestCase):
         # focus legitimately dismisses the launcher.
         self.app.root.unbind("<FocusOut>")
         self.app.show()
-        for _ in range(ui.FADE_STEPS + 2):
-            self.app.root.update()
-            self.app.root.after(ui.FRAME_MS)
-            self.app.root.update()
+        self.settle()
         self.assertAlmostEqual(
             float(self.app.root.attributes("-alpha")), self.app.alpha, places=2)
 
     def test_slide_offset_settles_at_zero(self):
         self.app.root.unbind("<FocusOut>")
         self.app.show()
-        # The first frame runs synchronously, so the offset has already begun
-        # closing the gap but must not have reached the resting position.
+        # The first frame runs synchronously, so the window is already on
+        # screen, sitting below where it will come to rest.
         self.assertGreater(self.app._anim_offset, 0)
-        self.assertLess(self.app._anim_offset, self.app.px(ui.SLIDE_PX))
-        for _ in range(ui.FADE_STEPS + 2):
-            self.app.root.update()
-            self.app.root.after(ui.FRAME_MS)
-            self.app.root.update()
+        self.assertLessEqual(self.app._anim_offset, self.app.px(ui.SLIDE_PX))
+        self.settle()
         self.assertEqual(self.app._anim_offset, 0)
 
-    def test_hide_resets_alpha_and_cancels_animation(self):
+    def settle(self, timeout=2.0):
+        """Run the loop until the window has finished animating."""
+        end = time.time() + timeout
+        while self.app._anim_id is not None and time.time() < end:
+            self.app.root.update()
+            time.sleep(0.005)
+        self.app.root.update()
+
+    def test_hiding_fades_rather_than_blinking_out(self):
         self.app.show()
+        self.settle()
         self.app.hide()
+        # Still on screen for a few milliseconds, on its way down.
+        self.assertIsNotNone(self.app._anim_id)
+        self.assertLess(float(self.app.root.attributes("-alpha")),
+                        self.app.alpha)
+
+    def test_hiding_ends_with_the_window_gone(self):
+        self.app.show()
+        self.settle()
+        self.app.hide()
+        self.settle()
         self.assertIsNone(self.app._anim_id)
         self.assertEqual(float(self.app.root.attributes("-alpha")), 0.0)
         self.assertEqual(self.app._anim_offset, 0)
+        self.assertFalse(self.app.root.winfo_ismapped())
+
+    def test_it_is_not_visible_the_moment_it_is_dismissed(self):
+        # Whatever is still on screen, a dismissed launcher is not open: the
+        # index refresh and the hotkey both ask this.
+        self.app.show()
+        self.app.hide()
+        self.assertFalse(self.app.is_visible())
+
+    def test_reopening_mid_fade_brings_it_back(self):
+        self.app.show()
+        self.settle()
+        self.app.hide()
+        self.app.show()
+        self.settle()
+        self.assertTrue(self.app.is_visible())
+        self.assertAlmostEqual(float(self.app.root.attributes("-alpha")),
+                               self.app.alpha, places=2)
+
+    def test_closing_sinks_back_the_way_it_came(self):
+        self.app.root.unbind("<FocusOut>")
+        self.app.show()
+        self.settle()
+        self.app.hide()
+        self.app.root.update()
+        # Part way down, never further than the drift allows, and back to the
+        # resting offset once the window is gone.
+        self.assertGreaterEqual(self.app._anim_offset, 0)
+        self.assertLessEqual(self.app._anim_offset, self.app.px(ui.CLOSE_DRIFT_PX))
+        self.settle()
+        self.assertEqual(self.app._anim_offset, 0)
+
+    def test_opening_takes_about_as_long_as_it_says(self):
+        self.app.root.unbind("<FocusOut>")
+        started = time.monotonic()
+        self.app.show()
+        self.settle()
+        elapsed = (time.monotonic() - started) * 1000
+        # Driven by the clock, not by counting frames: a late frame shortens
+        # the remaining steps rather than stretching the whole animation.
+        self.assertGreaterEqual(elapsed, ui.OPEN_MS * 0.5)
+        self.assertLess(elapsed, ui.OPEN_MS + 120)
+
+    def test_the_finer_timer_is_handed_back_after_animating(self):
+        self.app.root.unbind("<FocusOut>")
+        self.app.show()
+        self.settle()
+        self.app.hide()
+        self.settle()
+        self.assertFalse(self.app._anim_fine)
+        self.assertEqual(self.app._fine_holds, 0)
+
+    def test_reopening_mid_fade_hands_the_timer_back_once(self):
+        # Cancelling an animation half way through must not leak the hold it
+        # took, or the process keeps Windows on 1ms timers for ever.
+        self.app.root.unbind("<FocusOut>")
+        for _ in range(3):
+            self.app.show()
+            self.app.hide()
+        self.app.show()
+        self.settle()
+        self.app.hide()
+        self.settle()
+        self.assertEqual(self.app._fine_holds, 0)
+
+    def test_hiding_an_already_hidden_window_is_immediate(self):
+        self.app.hide()
+        self.assertIsNone(self.app._anim_id)
+        self.assertEqual(float(self.app.root.attributes("-alpha")), 0.0)
 
     def test_opacity_defaults_to_module_value(self):
         self.assertEqual(self.app.alpha, ui.ALPHA)
@@ -414,3 +497,62 @@ class TestRowFitting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+@unittest.skipUnless(TK_AVAILABLE, "no Tk display available")
+class TestPlaceholder(unittest.TestCase):
+    """An empty bar should say what it is for."""
+
+    def setUp(self):
+        self.app = make(lambda: ui.Launcher(StubController([])))
+
+    def tearDown(self):
+        try:
+            self.app.shutdown()
+            self.app.root.destroy()
+        except Exception:
+            pass
+        self.app = None
+        gc.collect()
+
+    def type_query(self, text):
+        self.app.entry.delete(0, "end")
+        self.app.entry.insert(0, text)
+        self.app._run_search()
+
+    def test_an_empty_bar_shows_the_hint(self):
+        self.assertTrue(self.app._placeholder_up)
+        self.assertEqual(self.app.placeholder.cget("text"), ui.PLACEHOLDER)
+
+    def test_typing_takes_it_away(self):
+        # It used to stay up and cover what had been typed, because Tk still
+        # reported the label as unmapped in the same callback that placed it.
+        self.type_query("report")
+        self.assertFalse(self.app._placeholder_up)
+        self.assertEqual(self.app.placeholder.place_info(), {})
+
+    def test_clearing_brings_it_back(self):
+        self.type_query("report")
+        self.type_query("")
+        self.assertTrue(self.app._placeholder_up)
+
+    def test_it_is_dimmer_than_the_text_it_stands_in_for(self):
+        self.assertEqual(self.app.placeholder.cget("fg"), ui.HINT)
+        self.assertNotEqual(ui.HINT, ui.FG)
+
+    def test_it_matches_the_entry_it_sits_in(self):
+        self.assertEqual(str(self.app.placeholder.cget("font")),
+                         str(self.app.entry.cget("font")))
+
+    def test_showing_an_empty_launcher_shows_the_hint(self):
+        self.type_query("report")
+        self.app.hide()
+        self.app.entry.delete(0, "end")
+        self.app.show()
+        self.assertTrue(self.app._placeholder_up)
+
+    def test_clicking_it_lands_in_the_entry(self):
+        self.app.show()
+        self.app.placeholder.event_generate("<Button-1>")
+        self.app.root.update()
+        self.assertEqual(self.app.root.focus_get(), self.app.entry)

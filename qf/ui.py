@@ -15,19 +15,27 @@ from tkinter import ttk
 from . import kinds, pdfpreview, shellicon, videopreview
 from .usage import OPEN_WEIGHT, REVEAL_WEIGHT
 
+PLACEHOLDER = "Search anything"
+
 BG = "#1b1c22"
 FG = "#f2f3f7"
 DIM = "#8b8fa3"
 ACCENT = "#5b7cfa"
 BORDER = "#3a3d4a"
-SEL_BG = "#2e3242"
+# The selected row carries a little of the accent's hue rather than being
+# merely a lighter grey, so it reads as chosen and belongs with the caret and
+# the spinner. Kept low in saturation: a solid blue band would shout.
+SEL_BG = "#2f3550"
 PANEL_BG = "#202128"
+# Dimmer than DIM: the placeholder is an invitation, not something already
+# typed, and it sits in the largest type in the window.
+HINT = "#5f6376"
 
 MAX_WIDTH = 720
 MIN_WIDTH = 420
 MAX_ROWS = 10
 DEBOUNCE_MS = 45
-CORNER_RADIUS = 16
+CORNER_RADIUS = 22
 
 SPI_GETWHEELSCROLLLINES = 0x0068
 WHEEL_PAGESCROLL = 0xFFFFFFFF
@@ -92,9 +100,22 @@ EXCERPT_PX = -10
 # config.json tunes it.
 ALPHA = 0.92
 MIN_ALPHA = 0.35
-FADE_STEPS = 9
-FRAME_MS = 12
 SLIDE_PX = 14
+# The window rises into place; on the way out it sinks back the way it came,
+# but only a little. A full 14px in 90ms reads as a drop rather than a
+# dismissal.
+CLOSE_DRIFT_PX = 6
+# Animations are driven by the clock rather than by counting frames, so they
+# take the time they say they take whether or not a frame is late. Counting
+# frames at a nominal 12ms produced a 182ms open in gaps of 20ms, because
+# Windows rounds every timer up to its 15.6ms tick; the launcher holds a 1ms
+# timer while animating for the same reason the video preview does.
+OPEN_MS = 150
+# Closing is quicker than opening. Opening is the moment worth easing into;
+# a window you have dismissed should be out of the way, and anything longer
+# stops Escape feeling instant.
+CLOSE_MS = 90
+FRAME_MS = 8
 
 SPIN_MS = 60
 SPIN_STEP = 30
@@ -315,7 +336,12 @@ class Launcher:
         self._video_ticks = 0
         self._video_id = None
         self._video_start = 0.0
-        self._fine_timer = False
+        # A finer system timer is wanted by both the video loop and the open
+        # and close animations, and every request for one has to be given
+        # back exactly once, so they are counted rather than flagged.
+        self._video_fine = False
+        self._anim_fine = False
+        self._fine_holds = 0
         self.video_enabled = bool(video_preview)
 
         self.root = tk.Tk()
@@ -373,6 +399,16 @@ class Launcher:
             relief="flat", bd=0, highlightthickness=0,
         )
         self.entry.pack(side="left", fill="x", expand=True)
+
+        # Tk entries have no placeholder, and putting real text in one means
+        # guarding every read, clear and selection against it. A label sitting
+        # over the empty entry says the same thing and cannot be typed into by
+        # accident; a click on it lands in the entry underneath.
+        self.placeholder = tk.Label(topbar, text=PLACEHOLDER, font=self.entry_font,
+                                    bg=BG, fg=HINT, bd=0)
+        self._placeholder_up = False
+        self.placeholder.bind("<Button-1>", lambda event: self.entry.focus_set())
+        self._sync_placeholder()
 
         self.separator = tk.Frame(outer, bg=BORDER, height=1)
         self.body = tk.Frame(outer, bg=BG)
@@ -511,6 +547,23 @@ class Launcher:
         return -scaled if value < 0 else scaled
 
     # -- chrome ------------------------------------------------------------
+
+    def _sync_placeholder(self) -> None:
+        """Show the hint only while there is nothing to search for.
+
+        Whether it is currently up is tracked here rather than asked of Tk:
+        `winfo_ismapped` stays False until the window is next updated, so a
+        hint placed and then typed over within one callback never came down.
+        """
+        wanted = not self.entry.get()
+        if wanted == self._placeholder_up:
+            return
+        self._placeholder_up = wanted
+        if wanted:
+            self.placeholder.place(in_=self.entry, x=self.px(2), rely=0.5,
+                                   anchor="w")
+        else:
+            self.placeholder.place_forget()
 
     def _draw_magnifier(self) -> None:
         p = self.px
@@ -923,9 +976,9 @@ class Launcher:
         self._video_index = 0
         self._video_ticks = 0
         self._video_start = time.monotonic()
-        if not self._fine_timer:
-            _fine_timer(True)
-            self._fine_timer = True
+        if not self._video_fine:
+            self._video_fine = True
+            self._hold_fine_timer()
         if not self.preview_image_label.winfo_ismapped():
             self.preview_image_label.pack(before=self.preview_name,
                                           pady=(self.px(14), self.px(8)))
@@ -985,11 +1038,9 @@ class Launcher:
             except Exception:
                 pass
             self._video_id = None
-        if self._fine_timer:
-            # Every timeBeginPeriod needs its timeEndPeriod; a finer system
-            # timer costs power, so it is held only while a clip is playing.
-            _fine_timer(False)
-            self._fine_timer = False
+        if self._video_fine:
+            self._video_fine = False
+            self._release_fine_timer()
         # Dropping the PhotoImages matters: a full preview of a pane-width clip
         # is about a hundred frames and 50MB inside Tk.
         self._video_frames = []
@@ -1013,6 +1064,28 @@ class Launcher:
 
     # -- animation ---------------------------------------------------------
 
+    def _hold_fine_timer(self) -> None:
+        self._fine_holds += 1
+        if self._fine_holds == 1:
+            _fine_timer(True)
+
+    def _release_fine_timer(self) -> None:
+        if not self._fine_holds:
+            return
+        self._fine_holds -= 1
+        if not self._fine_holds:
+            _fine_timer(False)
+
+    def _anim_hold(self) -> None:
+        if not self._anim_fine:
+            self._anim_fine = True
+            self._hold_fine_timer()
+
+    def _anim_release(self) -> None:
+        if self._anim_fine:
+            self._anim_fine = False
+            self._release_fine_timer()
+
     def _cancel_anim(self) -> None:
         if self._anim_id is not None:
             try:
@@ -1020,25 +1093,37 @@ class Launcher:
             except Exception:
                 pass
             self._anim_id = None
+        # A cancelled animation never reaches the last frame, which is where
+        # the finer timer would otherwise have been handed back.
+        self._anim_release()
 
     def _fade_in(self) -> None:
         self._cancel_anim()
+        self._anim_hold()
+        start = time.monotonic()
 
-        def frame(step):
+        def frame():
             self._anim_id = None
             if not self.alive() or not self._visible:
+                self._anim_release()
                 return
-            progress = step / FADE_STEPS
-            eased = 1 - (1 - progress) ** 3
-            self.root.attributes("-alpha", self.alpha * eased)
-            self._anim_offset = int(self.px(SLIDE_PX) * (1 - eased))
+            progress = min(1.0, (time.monotonic() - start) / (OPEN_MS / 1000))
+            # Two curves, because they are doing different jobs. The window
+            # slides in and decelerates into place; the opacity rises evenly,
+            # since a single ease-out put it at 40% on the first painted frame
+            # and then spent the rest of the animation on the last 8%.
+            settle = 1 - (1 - progress) ** 3
+            lit = progress * progress * (3 - 2 * progress)
+            self.root.attributes("-alpha", self.alpha * lit)
+            self._anim_offset = int(self.px(SLIDE_PX) * (1 - settle))
             self._position()
-            if step < FADE_STEPS:
-                self._anim_id = self.root.after(FRAME_MS, frame, step + 1)
+            if progress < 1.0:
+                self._anim_id = self.root.after(FRAME_MS, frame)
             else:
                 self._anim_offset = 0
+                self._anim_release()
 
-        frame(1)
+        frame()
 
     def _spin(self) -> None:
         if self._spin_id is not None:
@@ -1079,6 +1164,7 @@ class Launcher:
             self._focus()
             return
         self._visible = True
+        self._sync_placeholder()
         self._anim_offset = self.px(SLIDE_PX)
         self.root.attributes("-alpha", 0.0)
         self.root.deiconify()
@@ -1091,6 +1177,9 @@ class Launcher:
             self._spin()
 
     def hide(self) -> None:
+        # Not visible from this moment, whatever the window is still doing on
+        # screen: everything that asks is asking whether a search is open.
+        was_visible = self._visible
         self._visible = False
         self._cancel_anim()
         for attr in ("_after_id", "_preview_id", "_deepen_id"):
@@ -1103,8 +1192,40 @@ class Launcher:
                 setattr(self, attr, None)
         self._stop_video()
         self._anim_offset = 0
+        if was_visible:
+            self._fade_out()
+        else:
+            self._vanish()
+
+    def _vanish(self) -> None:
+        self._cancel_anim()
         self.root.withdraw()
         self.root.attributes("-alpha", 0.0)
+
+    def _fade_out(self) -> None:
+        """Dim away rather than blink out, then withdraw."""
+        self._anim_hold()
+        from_alpha = float(self.root.attributes("-alpha") or self.alpha)
+        start = time.monotonic()
+
+        def frame():
+            self._anim_id = None
+            if not self.alive() or self._visible:
+                # Reopened mid-fade: `show` owns the window again.
+                self._anim_release()
+                return
+            progress = min(1.0, (time.monotonic() - start) / (CLOSE_MS / 1000))
+            self.root.attributes("-alpha", from_alpha * (1 - progress) ** 2)
+            self._anim_offset = int(self.px(CLOSE_DRIFT_PX) * progress * progress)
+            self._position()
+            if progress < 1.0:
+                self._anim_id = self.root.after(FRAME_MS, frame)
+            else:
+                self._anim_release()
+                self._anim_offset = 0
+                self._vanish()
+
+        frame()
 
     def toggle(self) -> None:
         self.hide() if self._visible else self.show()
@@ -1149,6 +1270,7 @@ class Launcher:
     # -- searching ---------------------------------------------------------
 
     def _on_key(self, event) -> None:
+        self._sync_placeholder()
         if event.keysym in ("Up", "Down", "Return", "Escape", "Prior", "Next"):
             return
         if self._after_id is not None:
@@ -1173,6 +1295,7 @@ class Launcher:
 
     def _run_search(self) -> None:
         self._after_id = None
+        self._sync_placeholder()
         query = self.entry.get()
         self.results, note = self.controller.query(query)
         # One column width for the whole result set, measured once. Deriving
