@@ -56,6 +56,12 @@ VIDEO_FPS = 20.0
 # steadier than two (3.0ms of jitter against 6.7ms).
 VIDEO_OPENING_FRAMES = 4
 VIDEO_CONVERT_PER_TICK = 1
+# Runs arrive about a second apart and each is 0.9s of playback, so starting on
+# the first one means the loop reaches its end and shows the opening frame
+# again before there is anything new to show. Holding the still thumbnail until
+# a second run is in hand leaves 0.65s of slack, and the preview then never
+# repeats until the whole clip is decoded, where looping is the point.
+VIDEO_BUFFER_RUNS = 2
 VIDEO_BOX = 190          # logical px; the pane is 250 wide
 
 # Fonts are given in pixels (negative sizes). Point sizes would be multiplied by
@@ -277,6 +283,8 @@ class Launcher:
         self._preview_image = None
         self._video_frames = []
         self._video_pending = []
+        self._video_runs = 0
+        self._video_final = False
         self._video_index = 0
         self._video_ticks = 0
         self._video_id = None
@@ -660,6 +668,9 @@ class Launcher:
                         path, size=box, count=VIDEO_SEGMENTS,
                         per_segment=VIDEO_PER_SEGMENT, fps=VIDEO_FPS,
                         on_segment=deliver)
+                    # No more runs. A clip short enough to yield only one has
+                    # to play rather than wait for a second that never comes.
+                    self._done.put(("video", token, None))
             except Exception:
                 pass
 
@@ -708,7 +719,11 @@ class Launcher:
                         self._show_preview(info)
                 elif kind == "video":
                     token, pngs = payload
-                    if token == self._preview_token:
+                    if token != self._preview_token:
+                        continue
+                    if pngs is None:
+                        self._finish_video()
+                    else:
                         self._extend_video(pngs)
         except queue.Empty:
             pass
@@ -802,22 +817,31 @@ class Launcher:
             self._jobs.put(("video", self._preview_token, info["path"], box))
 
     def _start_video(self, pngs) -> None:
-        """Swap the still for a looping clip."""
+        """Swap the still for a looping clip that is already complete."""
         self._stop_video()
+        self._video_final = True
         self._extend_video(pngs)
 
+    def _finish_video(self) -> None:
+        """The decoder has no more runs; play whatever arrived."""
+        self._video_final = True
+        self._extend_video([])
+
     def _extend_video(self, pngs) -> None:
-        """Add a decoded run, starting playback if this is the first one."""
-        if not pngs:
-            return
+        """Add a decoded run, starting playback once there is enough to loop."""
+        if pngs:
+            self._video_pending.extend(pngs)
+            self._video_runs += 1
         if self._video_frames:
             # Already looping. Turning a run into images costs about 10ms a
             # frame, which would stall the animation for a fifth of a second
-            # every time one arrived, so they are converted a couple per tick
+            # every time one arrived, so they are converted one per tick
             # instead.
-            self._video_pending.extend(pngs)
             return
-        self._video_pending.extend(pngs)
+        if self._video_runs < VIDEO_BUFFER_RUNS and not self._video_final:
+            # Not enough to play without catching up with the decoder. The
+            # still thumbnail stays up in the meantime.
+            return
         if not self._convert_pending(VIDEO_OPENING_FRAMES):
             return
         self._video_index = 0
@@ -894,6 +918,8 @@ class Launcher:
         # is about a hundred frames and 50MB inside Tk.
         self._video_frames = []
         self._video_pending = []
+        self._video_runs = 0
+        self._video_final = False
         self._video_index = 0
         self._video_ticks = 0
 

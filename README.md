@@ -61,7 +61,8 @@ Undo that with `--uninstall-task`.
 | `Esc` | Dismiss |
 
 Clicking away also dismisses it. The preview pane follows the selection, and a
-selected video starts playing a silent preview about a second later.
+selected video holds its thumbnail for a moment and then plays a silent
+preview.
 
 The list holds more than it shows. Forty rows are rendered to start with and
 another forty arrive as you scroll toward the end, up to eight pages, so a
@@ -385,9 +386,14 @@ Four decisions keep it fast enough to run on a hover:
   followed by consecutive reads. Running forward to the exact requested time is
   bounded, because on a long group of pictures it consumed the whole read
   budget and returned nothing.
-* **Runs are handed over as they finish.** The preview starts playing after the
-  first run, about 900 ms in, and lengthens as the rest arrive. Nobody waits
-  for the full decode.
+* **Runs are handed over as they finish**, and the preview lengthens as they
+  arrive rather than waiting for the whole decode. It does wait for the second
+  one, though, at about two seconds, because a run is 0.9 seconds of playback
+  and the next takes about a second to decode: starting on the first meant the
+  loop reached its end and showed the opening frame again before there was
+  anything new. Two runs in hand leaves 0.65 seconds of slack, and the still
+  thumbnail holds the pane until then. Measured on three clips, the preview
+  then plays all 108 frames before anything repeats.
 * **Stale work is abandoned, not decoded.** A full preview costs a few seconds,
   so sweeping down a list of videos would queue one decode per row. The worker
   skips jobs whose selection has already moved on, and a decode in progress
@@ -425,9 +431,10 @@ whole file, which is not something hovering a row should start. The preview pane
 says "Online only, not downloaded" instead of showing an empty box, and text
 excerpts are skipped for the same reason.
 
-Across a 24 video sample on the development machine, motion appeared after a
-median of 884 ms and the full six run preview took a median of 4.9 seconds, all
-of it on the worker thread with the still thumbnail already on screen.
+Across a 24 video sample on the development machine, the first run was decoded
+after a median of 977 ms and the full six run preview took a median of 4.8
+seconds, all of it on the worker thread with the still thumbnail on screen.
+Motion starts once the second run lands, around two seconds in.
 
 ### Runs that do not move
 
@@ -519,7 +526,7 @@ hold on any machine.
 ## Development
 
 ```sh
-python -m unittest discover -s tests     # 428 tests
+python -m unittest discover -s tests     # 432 tests
 python quickfind.py --bench report       # time a query
 python quickfind.py --selftest-mft       # verify MFT enumeration (needs admin)
 ```

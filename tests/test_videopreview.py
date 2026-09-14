@@ -579,8 +579,18 @@ class TestPlayback(unittest.TestCase):
         self.app.show()
         self.app._preview_token = 5
         self.app._done.put(("video", 5, self.frames))
+        self.app._done.put(("video", 5, self.frames))
         self.app._pump()
-        self.assertEqual(len(self.app._video_frames), 3)
+        self.assertTrue(self.app._video_frames)
+
+    def test_the_end_of_the_decode_is_carried_through(self):
+        self.app.show()
+        self.app._preview_token = 5
+        self.app._done.put(("video", 5, self.frames))
+        self.app._done.put(("video", 5, None))
+        self.app._pump()
+        self.assertTrue(self.app._video_final)
+        self.assertTrue(self.app._video_frames, "one run should play at the end")
 
     def test_undecodable_frames_do_not_crash(self):
         self.app.show()
@@ -634,8 +644,11 @@ class TestPlayback(unittest.TestCase):
             self.app._jobs.put(("video", 9, r"C:\v\clip.mp4", (100, 100)))
             self.run_worker()
         delivered = [item for item in list(self.app._done.queue)
-                     if item[0] == "video"]
+                     if item[0] == "video" and item[2] is not None]
         self.assertEqual(len(delivered), 3, "runs should arrive one at a time")
+        endings = [item for item in list(self.app._done.queue)
+                   if item[0] == "video" and item[2] is None]
+        self.assertEqual(len(endings), 1, "the end should be announced once")
 
     def test_a_decode_is_abandoned_when_the_selection_moves(self):
         def decode(path, size=None, count=1, per_segment=1, fps=12.0,
@@ -682,17 +695,46 @@ class TestPlayback(unittest.TestCase):
         # Motion should start as soon as a few frames exist, not once the
         # whole run has been converted.
         self.app.show()
+        self.app._extend_video(self.frames)
         self.app._extend_video(self.frames * 5)
         self.assertIsNotNone(self.app._video_id, "playback did not start")
         self.assertLessEqual(len(self.app._video_frames),
                              ui.VIDEO_OPENING_FRAMES + ui.VIDEO_CONVERT_PER_TICK)
         self.assertTrue(self.app._video_pending, "the rest should still wait")
 
-    def test_the_first_run_starts_playback(self):
+    def test_one_run_is_not_enough_to_start_on(self):
+        """Playing the first run alone catches up with the decoder.
+
+        A run is 0.9s of playback and the next takes about a second to
+        arrive, so the loop reached its end and showed the opening frame
+        again before there was anything new. The still thumbnail stays up
+        until a second run is in hand.
+        """
         self.app.show()
-        self.assertIsNone(self.app._video_id)
+        self.app._extend_video(self.frames)
+        self.assertIsNone(self.app._video_id, "started too early")
+        self.assertEqual(self.app._video_frames, [])
+
+    def test_the_second_run_starts_playback(self):
+        self.app.show()
+        self.app._extend_video(self.frames)
         self.app._extend_video(self.frames)
         self.assertIsNotNone(self.app._video_id)
+        self.assertTrue(self.app._video_frames)
+
+    def test_a_clip_with_only_one_run_still_plays(self):
+        # A short clip yields one run and no second one is ever coming.
+        self.app.show()
+        self.app._extend_video(self.frames)
+        self.assertIsNone(self.app._video_id)
+        self.app._finish_video()
+        self.assertIsNotNone(self.app._video_id)
+
+    def test_the_decoder_finishing_with_nothing_starts_nothing(self):
+        self.app.show()
+        self.app._finish_video()
+        self.assertIsNone(self.app._video_id)
+        self.assertEqual(self.app._video_frames, [])
 
     def test_shutdown_stops_playback(self):
         self.app.show()
