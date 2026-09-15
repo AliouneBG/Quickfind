@@ -843,6 +843,13 @@ def main() -> int:
     log(f"ready as {mode}, {live}, tray={'on' if tray_icon else 'off'}")
     print(f"QuickFind running as {mode}, {live}. "
           f"Press {cfg['hotkey']} to search.")
+    # Launching is itself a request to search: without this, double-clicking
+    # the shortcut for the first time started a background process with
+    # nothing on screen, and the only way to discover it had worked was to
+    # already know to press the hotkey. Queued rather than called directly,
+    # since the window cannot show itself before the event loop that
+    # `controller.run()` starts is actually pumping.
+    controller.request_show()
     try:
         controller.run()
     finally:

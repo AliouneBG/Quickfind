@@ -37,8 +37,11 @@ See [Administrator mode](#administrator-mode) for what it buys and what it
 costs. If you decline, everything still works with slower indexing and no live
 updates.
 
-To run without a console window, double-click `QuickFind.vbs`. To start it at
-login, put a shortcut to that file in `shell:startup`.
+To run without a console window, double-click `QuickFind.vbs`. Launching opens
+the window immediately, the same as pressing the hotkey -- otherwise there is
+no sign anything happened until you already know to press it. To start it at
+login, put a shortcut to that file in `shell:startup`; the window will open
+once, right after login, for the same reason.
 
 To skip the UAC prompt entirely, register a logon task once from an elevated
 prompt:

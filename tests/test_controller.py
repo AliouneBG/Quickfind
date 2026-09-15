@@ -2,6 +2,7 @@ import gc
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -149,6 +150,22 @@ class TestController(unittest.TestCase):
         self.assertFalse(self.controller.app.alive())
         self.controller._drain()  # must not raise or reschedule
         self.controller.app.set_status("ignored")
+
+    def test_a_show_request_queued_before_the_loop_starts_still_shows(self):
+        # This is what a fresh launch does: request_show() is called once,
+        # right before the event loop that would actually process it starts.
+        # Without it, double-clicking the shortcut for the first time started
+        # a background process with nothing on screen, and the only way to
+        # tell it had worked was to already know to press the hotkey.
+        self.assertFalse(self.controller.app.is_visible())
+        self.controller.request_show()
+        # The drain loop runs on an 80ms `after` tick, not on `update()` alone.
+        root = self.controller.app.root
+        deadline = time.time() + 2.0
+        while not self.controller.app.is_visible() and time.time() < deadline:
+            root.update()
+            time.sleep(0.01)
+        self.assertTrue(self.controller.app.is_visible())
 
 
 if __name__ == "__main__":
