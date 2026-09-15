@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -11,7 +12,7 @@ try:
     import tkinter as tk
 except Exception:
     tk = None
-from _tkcheck import TK_AVAILABLE, make
+from _tkcheck import TK_AVAILABLE, make, run_search
 
 from qf import search, ui
 
@@ -63,7 +64,7 @@ class TestLauncher(unittest.TestCase):
     def type_query(self, text):
         self.app.entry.delete(0, "end")
         self.app.entry.insert(0, text)
-        self.app._run_search()
+        run_search(self.app)
 
     def test_results_render_one_row_each(self):
         self.type_query("report")
@@ -169,7 +170,7 @@ class TestLauncherWithRealSearcher(unittest.TestCase):
         for i in range(1, len("report.txt") + 1):
             self.app.entry.delete(0, "end")
             self.app.entry.insert(0, "report.txt"[:i])
-            self.app._run_search()
+            run_search(self.app)
             counts.append(self.app.row_count())
         self.assertEqual(counts, sorted(counts, reverse=True))
         self.assertIn("report.txt", self.app.row_text(0))
@@ -269,16 +270,27 @@ class TestChrome(unittest.TestCase):
         self.settle()
         self.assertEqual(self.app._anim_offset, 0)
 
-    def test_opening_takes_about_as_long_as_it_says(self):
+    def test_opening_is_driven_by_the_clock_not_by_counting_frames(self):
+        # Counting frames made the animation take as long as Windows felt like
+        # delivering them: a nominal 150ms ran for 182. Asking the clock how
+        # far along it is means a late frame shortens the steps that remain.
+        # Driving the clock by hand says so without timing the machine, which
+        # a loaded one would fail for reasons of its own.
         self.app.root.unbind("<FocusOut>")
-        started = time.monotonic()
-        self.app.show()
-        self.settle()
-        elapsed = (time.monotonic() - started) * 1000
-        # Driven by the clock, not by counting frames: a late frame shortens
-        # the remaining steps rather than stretching the whole animation.
-        self.assertGreaterEqual(elapsed, ui.OPEN_MS * 0.5)
-        self.assertLess(elapsed, ui.OPEN_MS + 120)
+        clock = [0.0]
+        with mock.patch.object(ui.time, "monotonic", lambda: clock[0]):
+            self.app.show()
+            # No time has passed, so however many frames have run, the window
+            # is nowhere near its resting state.
+            self.assertLess(float(self.app.root.attributes("-alpha")),
+                            self.app.alpha)
+            self.assertGreater(self.app._anim_offset, 0)
+            # Now it has. The next frame finishes the whole animation.
+            clock[0] = ui.OPEN_MS / 1000
+            self.settle()
+        self.assertAlmostEqual(float(self.app.root.attributes("-alpha")),
+                               self.app.alpha, places=2)
+        self.assertEqual(self.app._anim_offset, 0)
 
     def test_the_finer_timer_is_handed_back_after_animating(self):
         self.app.root.unbind("<FocusOut>")
@@ -435,7 +447,7 @@ class TestRowFitting(unittest.TestCase):
         ]
         self.app.controller = StubController(rows)
         self.app.entry.insert(0, "q")
-        self.app._run_search()
+        run_search(self.app)
         self.assertEqual(self.app.row_count(), len(rows))
         for n in range(self.app.row_count()):
             self.assertLessEqual(self.row_px(self.app.row_text(n)),
@@ -518,7 +530,7 @@ class TestPlaceholder(unittest.TestCase):
     def type_query(self, text):
         self.app.entry.delete(0, "end")
         self.app.entry.insert(0, text)
-        self.app._run_search()
+        run_search(self.app)
 
     def test_an_empty_bar_shows_the_hint(self):
         self.assertTrue(self.app._placeholder_up)
@@ -553,6 +565,16 @@ class TestPlaceholder(unittest.TestCase):
 
     def test_clicking_it_lands_in_the_entry(self):
         self.app.show()
+        # Focus starts in the entry, so move it away or the click is not
+        # what put it back. The magnifier, because it is always packed:
+        # `focus_set` on a widget that is not on screen does nothing,
+        # and this window has no results, so it has no list.
+        self.app.root.update()
+        self.app.glyph.focus_set()
+        self.app.root.update()
+        self.assertIsNot(self.app.root.focus_lastfor(), self.app.entry)
         self.app.placeholder.event_generate("<Button-1>")
         self.app.root.update()
-        self.assertEqual(self.app.root.focus_get(), self.app.entry)
+        # Not `focus_get`: that is None unless this process holds the
+        # OS focus, which another test's window may well have taken.
+        self.assertEqual(self.app.root.focus_lastfor(), self.app.entry)

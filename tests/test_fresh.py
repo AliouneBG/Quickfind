@@ -4,6 +4,7 @@ import os
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -377,6 +378,52 @@ class TestFreshResults(unittest.TestCase):
         self.controller._refresh_fresh()
         self.assertEqual(self.controller._fresh_at, built_at,
                          "a burst of arrivals must not rebuild per file")
+
+    def test_a_file_arriving_during_a_search_does_not_break_it(self):
+        """The search runs on a worker; the watcher reports on the UI thread.
+
+        Both reach the list of fresh files, and rebuilding the fresh index
+        iterated it directly, so an arrival landing mid-query would raise
+        "dictionary changed size during iteration" and lose the search. The
+        window is narrow in practice, so it is widened here: the iteration is
+        slowed down until the other thread is certain to land inside it.
+        """
+
+        class Slow(dict):
+            def values(self):
+                for value in super().values():
+                    time.sleep(0.002)
+                    yield value
+
+        self.arrive("first.pdf")
+        with self.controller._fresh_lock:
+            slow = Slow(self.controller._fresh)
+            for i in range(20):
+                path = os.path.join(self.tmp.name, "f{}.pdf".format(i))
+                slow[path.lower()] = (path, False, 0, time.time())
+            self.controller._fresh = slow
+            self.controller._fresh_dirty = True
+            self.controller._fresh_at = 0.0
+
+        errors = []
+
+        def arriving():
+            # Lands somewhere inside the slowed-down iteration.
+            time.sleep(0.02)
+            try:
+                self.controller._note_fresh(
+                    os.path.join(self.tmp.name, "late.pdf"), False)
+            except Exception as exc:          # pragma: no cover - the bug
+                errors.append(exc)
+
+        noting = threading.Thread(target=arriving, daemon=True)
+        noting.start()
+        try:
+            self.controller._refresh_fresh(force=True)
+        except RuntimeError as exc:           # pragma: no cover - the bug
+            errors.append(exc)
+        noting.join(timeout=2)
+        self.assertEqual([str(e) for e in errors], [])
 
     def test_the_status_command_mentions_new_files(self):
         self.arrive("brand new.pdf")

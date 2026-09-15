@@ -349,6 +349,63 @@ The folder column is measured once per search rather than per paint. Deriving
 it from whatever happens to be in view would make the folders shuffle sideways
 every time the list moved.
 
+### Keeping the window responsive while you type
+
+Typing felt stiff, and the reason was not what it looked like. A character
+echoes in 1-3 ms and always did; what was wrong was that the window froze
+*between* keystrokes, which is a different measurement. A heartbeat scheduled
+every 4 ms on the UI thread finds those gaps: anything much over 4 ms is time
+the window could not repaint, follow the mouse, or show the next character.
+
+Three things were causing them.
+
+**The debounce does not coalesce anything.** 45 ms is shorter than the gap
+between keystrokes at any human typing speed, so every character reached the
+searcher. This was assumed rather than measured, and the assumption was wrong.
+
+**The deeper search ran between every pair of keystrokes.** It waited 120 ms,
+which is also shorter than that gap. At 250 ms a character it ran six times
+while typing "python", on the UI thread, at 42-64 ms each, and every answer was
+thrown away by the next character. It now waits 350 ms, so it runs when typing
+has actually stopped.
+
+**The search itself held the UI thread.** 5-30 ms per keystroke on a
+757k-entry index. Both searches now run on one worker thread -- one, not two,
+because `Searcher` keeps a refinement cache that `search` writes to and two
+threads in there at once would corrupt it. The quick answer is collected on a
+4 ms pump that only ticks while a search is out; the deeper one rides the 50 ms
+tick the shell worker already uses.
+
+That alone did not fix it, because a worker thread still holds the
+interpreter. Python hands it over every 5 ms by default, which is 5 ms the
+window cannot repaint, and the stalls stack up. At 0.5 ms the stalls halve and
+the search is no slower -- 89 ms against 91 ms for the same seven queries,
+because the setting costs nothing unless threads are contending. 0.2 ms was
+worse again: past some point the switching is the work.
+
+Measured while typing five words, stalls over 16 ms:
+
+| | worst stall | typical stall |
+| --- | --- | --- |
+| Before | 52-86 ms | 40-71 ms |
+| After | 20-41 ms | 17-31 ms |
+
+Moving work off the UI thread moves what that work touches with it, and two
+things needed guarding. `Searcher` keeps a refinement cache that `search`
+writes to, which is why there is one search worker rather than two. And the
+list of files that arrived since the index was built is noted on the UI thread
+as the watcher reports, but read by the worker on its way to answering a query,
+since a file downloaded seconds ago is exactly what someone is looking for:
+that list is now copied under a lock and the index built outside it, so a
+rebuild never holds up the thread noting the next change.
+
+One thing that looked like a cause and was not: `_position` forces
+`update_idletasks` to measure the window, 23 ms of it during typing, and the
+geometry it then computes is the one already set 26 times out of 27. Skipping
+it when the shape has not changed removed the forced flush and changed the
+stalls not at all -- Tk does that work at the next idle moment either way. The
+skip is still there, since it is free, but it was not the problem.
+
 ### Fetching in two steps
 
 Resolving a path is what a result costs, so a search that materialises two

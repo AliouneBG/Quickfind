@@ -13,7 +13,7 @@ try:
     import tkinter as tk
 except Exception:
     tk = None
-from _tkcheck import TK_AVAILABLE, make
+from _tkcheck import TK_AVAILABLE, make, run_search
 
 from qf import shellicon, ui
 
@@ -183,7 +183,7 @@ class TestIconPipeline(unittest.TestCase):
         self.app = make(lambda: ui.Launcher(Stub(self.rows)))
         self.app._ensure_worker = lambda: None      # no real shell calls
         self.app.entry.insert(0, "q")
-        self.app._run_search()
+        run_search(self.app)
 
     def tearDown(self):
         self.app.shutdown()
@@ -231,7 +231,7 @@ class TestPreviewPane(unittest.TestCase):
         self.app = make(lambda: ui.Launcher(Stub(self.rows)))
         self.app._ensure_worker = lambda: None
         self.app.entry.insert(0, "q")
-        self.app._run_search()
+        run_search(self.app)
 
     def tearDown(self):
         self.app.shutdown()
@@ -344,7 +344,7 @@ class TestPreviewPane(unittest.TestCase):
     def test_empty_results_hide_the_pane(self):
         self.app.show()
         self.app.entry.delete(0, "end")
-        self.app._run_search()
+        run_search(self.app)
         self.assertFalse(self.app.preview.winfo_ismapped())
 
     def test_pane_is_visible_with_results(self):

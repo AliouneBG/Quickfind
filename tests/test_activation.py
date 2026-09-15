@@ -12,7 +12,7 @@ try:
     import tkinter as tk
 except Exception:
     tk = None
-from _tkcheck import TK_AVAILABLE, make
+from _tkcheck import TK_AVAILABLE, make, run_search
 
 from qf import ui
 
@@ -62,7 +62,7 @@ class TestSelectionSurvives(unittest.TestCase):
     def search(self, text="d"):
         self.app.entry.delete(0, "end")
         self.app.entry.insert(0, text)
-        self.app._run_search()
+        run_search(self.app)
 
     def test_tree_selection_is_independent_of_the_system_selection(self):
         # A Listbox tied its selection to the system selection, so the entry's
@@ -133,7 +133,7 @@ class TestBindingsAreGlobal(unittest.TestCase):
     def test_escape_hides_even_with_listbox_focused(self):
         self.app.show()
         self.app.entry.insert(0, "a")
-        self.app._run_search()
+        run_search(self.app)
         self.app.tree.focus_set()
         self.app.root.update()
         self.app.root.event_generate("<Escape>")
@@ -148,7 +148,7 @@ class TestMouse(unittest.TestCase):
         self.app = make(lambda: ui.Launcher(Stub(self.rows)))
         self.app.show()
         self.app.entry.insert(0, "file")
-        self.app._run_search()
+        run_search(self.app)
         self.app.root.update()
 
     def tearDown(self):
@@ -186,9 +186,16 @@ class TestMouse(unittest.TestCase):
         revealer.assert_called_once_with(self.rows[2].path)
 
     def test_click_selects_and_returns_focus_to_the_entry(self):
+        # A click lands in the tree, and the launcher hands focus back so
+        # that typing still refines the search. Put it somewhere else
+        # first, or the entry holding it from `show` proves nothing.
+        self.app.tree.focus_set()
+        self.assertIsNot(self.app.root.focus_lastfor(), self.app.entry)
         self.app._on_click(Event(self.row_centre(3)))
         self.assertEqual(self.app._selected(), 3)
-        self.assertIs(self.app.root.focus_get(), self.app.entry)
+        # Not `focus_get`: that is None unless this process holds the OS
+        # focus, which another test's window may well have taken.
+        self.assertIs(self.app.root.focus_lastfor(), self.app.entry)
 
     def test_hover_outside_rows_clamps(self):
         self.app._on_hover(Event(99999))
@@ -203,7 +210,7 @@ class TestMissingPaths(unittest.TestCase):
         self.app = make(lambda: ui.Launcher(Stub(self.rows)))
         self.app.show()
         self.app.entry.insert(0, "gone")
-        self.app._run_search()
+        run_search(self.app)
 
     def tearDown(self):
         self.app.shutdown()

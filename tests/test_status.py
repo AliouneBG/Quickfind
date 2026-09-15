@@ -5,6 +5,7 @@ files, and nothing hinted that a second word would cut that to one.
 """
 import os
 import sys
+import threading
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -77,6 +78,9 @@ class TestStatusLine(unittest.TestCase):
             # methods run so the status line is exercised as it ships.
             fresh_searcher = None
             _fresh_dirty = False
+            # The fresh list is reached from the search worker as well
+            # as the UI thread, so the real method takes a lock.
+            _fresh_lock = threading.Lock()
             _refresh_fresh = quickfind.Controller._refresh_fresh
             _with_fresh = quickfind.Controller._with_fresh
             _search = quickfind.Controller._search

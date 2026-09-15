@@ -13,7 +13,7 @@ try:
     import tkinter as tk
 except Exception:
     tk = None
-from _tkcheck import TK_AVAILABLE, make
+from _tkcheck import TK_AVAILABLE, make, run_search
 
 from qf import shellicon, ui
 
@@ -63,7 +63,7 @@ class TestPageView(unittest.TestCase):
         self.app = app
         app.root.unbind("<FocusOut>")
         app.show()
-        app._run_search()
+        run_search(app)
         # winfo_ismapped only tells the truth once Tk has laid the window out.
         app.root.update()
         return app
@@ -128,8 +128,33 @@ class TestPageView(unittest.TestCase):
                                return_value=(PNG, 3)):
             app._toggle_page_view()
             self.settle(app)
+        app.entry.insert("end", "x")
         app._on_key(type("E", (), {"keysym": "x"})())
         self.assertIsNone(app._page_path)
+
+    def test_letting_go_of_ctrl_space_does_not_shut_it_again(self):
+        # The page view opens on <Control-space>; the KeyRelease of the space
+        # and of Ctrl itself then arrive at the search box. Neither changes
+        # the query, so neither is a reason to put the page away.
+        app = self.launcher(self.rows("contract.pdf"))
+        with mock.patch.object(ui.pdfpreview, "render_page",
+                               return_value=(PNG, 3)):
+            app._toggle_page_view()
+            self.settle(app)
+            for released in ("space", "Control_L"):
+                app._on_key(type("E", (), {"keysym": released})())
+        self.assertEqual(app._page_path, os.path.join("C:\\docs", "contract.pdf"))
+
+    def test_a_key_that_changes_nothing_does_not_search_again(self):
+        app = self.launcher(self.rows("contract.pdf"))
+        app.entry.insert(0, "report")
+        app._on_key(type("E", (), {"keysym": "t"})())
+        self.assertIsNotNone(app._after_id)
+        app.root.after_cancel(app._after_id)
+        app._after_id = None
+        # Moving the caret leaves the query alone, so nothing is scheduled.
+        app._on_key(type("E", (), {"keysym": "Left"})())
+        self.assertIsNone(app._after_id)
 
     def test_dismissing_the_launcher_closes_the_page(self):
         app = self.launcher(self.rows("contract.pdf"))
@@ -157,7 +182,11 @@ class TestPageView(unittest.TestCase):
             app._on_page_back()
             self.settle(app)
             self.assertEqual(app._page_index, 1)
-        asked = [call.args[1] for call in render.call_args_list]
+        # The side pane renders page one through the same function, so count
+        # only the renders asked for at the expanded view's size.
+        box = app._page_box()
+        asked = [call.args[1] for call in render.call_args_list
+                 if call.kwargs.get("box") == box]
         self.assertEqual(asked, [0, 1, 2, 1])
 
     def test_it_will_not_page_past_either_end(self):
@@ -207,7 +236,12 @@ class TestPageView(unittest.TestCase):
                                return_value=(PNG, 1)) as render:
             app._toggle_page_view()
             self.settle(app)
-        width, height = render.call_args.kwargs["box"]
+        # The side pane renders page one through the same function, and its
+        # call can be the last one, so ask whether the expanded view's size
+        # was requested rather than what the most recent request happened to be.
+        boxes = [call.kwargs.get("box") for call in render.call_args_list]
+        self.assertIn(app._page_box(), boxes)
+        width, height = app._page_box()
         # Far larger than the side pane could ever give it, which is the
         # entire point of expanding.
         self.assertGreater(width, app.preview_width)
@@ -279,9 +313,12 @@ class TestPageView(unittest.TestCase):
             "meta": "Document\n362.5 KB\n19 Sep 2024  03:04\n7 pages",
             "excerpt": "",
             "is_video": False,
+            "is_pdf": True,
         })
         app.root.update_idletasks()
-        bottom = app.preview_meta.winfo_y() + app.preview_meta.winfo_reqheight()
+        self.assertTrue(app.preview_hint.winfo_ismapped())
+        last = app.preview_hint
+        bottom = last.winfo_y() + last.winfo_reqheight()
         self.assertLessEqual(bottom, app.preview.winfo_reqheight())
 
     def test_the_selection_holds_still_behind_the_page(self):

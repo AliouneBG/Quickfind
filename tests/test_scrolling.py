@@ -14,23 +14,23 @@ try:
     import tkinter as tk
 except Exception:
     tk = None
-from _tkcheck import TK_AVAILABLE, make
+from _tkcheck import TK_AVAILABLE, make, run_search
 
 from qf import ui
 
 
-def deepen(app, timeout=2.0):
+def deepen(app, timeout=4.0):
     """Run the deeper search and wait for its answer to reach the UI.
 
-    It runs on a thread of its own now, so that a 40ms search does not stall
-    the window between keystrokes. The launcher collects the answer on its
+    It runs on the search worker now, so that a 40ms search does not stall the
+    window between keystrokes. The launcher collects the answer on its
     ordinary 50ms tick; here the wait is explicit.
     """
     app._deepen()
     end = time.time() + timeout
-    while app._deep_done.empty() and time.time() < end:
+    while app._search_done.empty() and time.time() < end:
         time.sleep(0.002)
-    app._drain_deep()
+    app._drain_search()
 
 
 
@@ -91,7 +91,7 @@ class TestViewport(unittest.TestCase):
         app.show()
         app.entry.delete(0, "end")
         app.entry.insert(0, "note")
-        app._run_search()
+        run_search(app)
         app.root.update()
         return app
 
@@ -267,7 +267,7 @@ class TestViewport(unittest.TestCase):
         app = self.launcher(self.rows(1000))
         app._scroll_to(600)
         app.controller.rows = self.rows(1000, prefix="other")
-        app._run_search()
+        run_search(app)
         self.assertEqual(app._top, 0)
         self.assertEqual(app._selected(), 0)
 
@@ -275,13 +275,13 @@ class TestViewport(unittest.TestCase):
         app = self.launcher(self.rows(1000))
         app._scroll_to(600)
         app.controller.rows = self.rows(1000, prefix="other")
-        app._run_search()
+        run_search(app)
         self.assertIn("other00000", self.shown(app)[0])
 
     def test_an_empty_search_empties_the_list(self):
         app = self.launcher(self.rows(1000))
         app.controller.rows = []
-        app._run_search()
+        run_search(app)
         self.assertEqual(app.tree.get_children(), ())
         self.assertEqual(app._selected(), -1)
 
@@ -442,14 +442,67 @@ class TestViewport(unittest.TestCase):
         app = self.launcher(self.rows(400))
         app.controller.more = lambda text: (self.rows(600), "600 matches")
         app._deepen()
-        end = time.time() + 2.0
-        while app._deep_done.empty() and time.time() < end:
+        end = time.time() + 4.0
+        while app._search_done.empty() and time.time() < end:
             time.sleep(0.002)
         # The search came back, but by now the box says something else.
         app.entry.delete(0, "end")
         app.entry.insert(0, "something else entirely")
-        app._drain_deep()
+        app._drain_search()
         self.assertEqual(app.row_count(), 400)
+
+    def test_the_search_does_not_run_on_the_ui_thread(self):
+        # 5-30ms of frozen window per keystroke on a 757k-entry index, and the
+        # debounce does not save you: 45ms is shorter than the gap between
+        # keystrokes at any human typing speed.
+        app = self.launcher(self.rows(10))
+        threads = []
+        app.controller.query = lambda text: (
+            threads.append(threading.current_thread().name) or (self.rows(5), "5"))
+        run_search(app)
+        self.assertEqual(app.row_count(), 5)
+        self.assertNotIn(threading.current_thread().name, threads)
+
+    def test_quick_and_deep_searches_never_overlap(self):
+        # `Searcher` keeps a refinement cache that `search` writes to. Two
+        # threads in there at once would corrupt it, so both kinds of search
+        # go through one worker.
+        app = self.launcher(self.rows(400))
+        inside = []
+        clash = []
+
+        def busy(rows):
+            def call(text):
+                inside.append(1)
+                if len(inside) > 1:
+                    clash.append(1)
+                time.sleep(0.02)
+                inside.pop()
+                return rows
+            return call
+
+        app.controller.query = busy((self.rows(400), "400"))
+        app.controller.more = busy((self.rows(900), "900"))
+        for _ in range(4):
+            app._run_search()
+            app._deepen()
+        end = time.time() + 4.0
+        while app._search_pending() and time.time() < end:
+            app._drain_search()
+            time.sleep(0.002)
+        app._drain_search()
+        self.assertEqual(clash, [])
+
+    def test_an_answer_to_a_query_already_typed_over_is_dropped(self):
+        app = self.launcher(self.rows(10))
+        app.controller.query = lambda text: (self.rows(99), "99")
+        run_search(app)
+        self.assertEqual(app.row_count(), 99)
+        # An answer from two queries ago turning up late must not land.
+        app._search_done.put(("quick", app._search_seq - 1, "old",
+                              self.rows(3), "3"))
+        app._drain_search()
+        self.assertEqual(app.row_count(), 99)
 
     def test_a_controller_without_deepening_is_fine(self):
         app = self.launcher(self.rows(50))

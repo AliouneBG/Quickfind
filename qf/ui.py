@@ -16,6 +16,8 @@ from . import kinds, pdfpreview, shellicon, videopreview
 from .usage import OPEN_WEIGHT, REVEAL_WEIGHT
 
 PLACEHOLDER = "Search anything"
+# Nobody guesses a shortcut. The pane says so, where you are already looking.
+READ_HINT = "Ctrl+Space to read"
 
 BG = "#1b1c22"
 FG = "#f2f3f7"
@@ -56,6 +58,9 @@ SCROLL_HINT = "  Scroll for more"
 # thread. Nobody can scroll past the first two hundred rows in a third of a
 # second, so having them later costs nothing.
 DEEPEN_MS = 350
+# How often the window looks for an answer while a search is out. Short: this
+# is the gap between typing and seeing, and it only ticks while one is running.
+SEARCH_PUMP_MS = 4
 
 PREVIEW_WIDTH = 250
 PREVIEW_DELAY_MS = 180
@@ -66,10 +71,11 @@ PREVIEW_THUMB = 132
 # them, even when a long filename wraps onto two lines.
 PREVIEW_PAGE = 150
 # The pane's floor, so it still has a shape when a search returns two rows.
-# A PDF's details run to four lines -- type, size, date and page count -- and
-# measured, that ran 25px past the old floor of 250 and clipped the page
-# count off the bottom.
-PREVIEW_MIN_HEIGHT = 280
+# A PDF says the most of anything here: four lines of details -- type, size,
+# date and page count -- and the line offering to open it. Measured, that ends
+# 304px down, and a widget the packer cannot fit is simply not drawn, so too
+# small a floor loses the last line silently rather than visibly.
+PREVIEW_MIN_HEIGHT = 310
 ICON_PUMP_MS = 50
 
 # The expanded page view. A page is worth expanding only if it becomes
@@ -372,12 +378,18 @@ class Launcher:
         self._jobs: queue.Queue = queue.Queue()
         self._done: queue.Queue = queue.Queue()
         self._worker = None
-        # The deeper search gets a thread to itself rather than sharing the
-        # shell worker: a cold icon takes 250ms, and a search queued behind a
-        # screenful of them would arrive long after it was wanted.
-        self._deep_jobs: queue.Queue = queue.Queue()
-        self._deep_done: queue.Queue = queue.Queue()
-        self._deep_worker = None
+        # Searching gets a thread of its own rather than sharing the shell
+        # worker: a cold icon takes 250ms, and a search queued behind a
+        # screenful of them would arrive long after it was wanted. Both the
+        # quick search and the deeper one go through this single thread,
+        # because `Searcher` keeps a refinement cache that `search` writes to;
+        # two threads in there at once would corrupt it.
+        self._search_jobs: queue.Queue = queue.Queue()
+        self._search_done: queue.Queue = queue.Queue()
+        self._search_worker = None
+        self._search_seq = 0
+        self._search_applied = 0
+        self._search_pump_id = None
         self._deep_seq = 0
         # The expanded page view: the PDF being read, or None.
         self._page_path = None
@@ -385,6 +397,8 @@ class Launcher:
         self._page_count = 0
         self._page_token = 0
         self._page_image = None
+        self._last_query = ""
+        self._shape_key = None
         self._preview_token = 0
         self._preview_image = None
         self._video_frames = []
@@ -579,6 +593,11 @@ class Launcher:
             justify="center")
         self.preview_meta.pack(pady=(self.px(6), self.px(8)), padx=self.px(12))
 
+        # Packed only for a PDF, which is the only thing there is to expand.
+        self.preview_hint = tk.Label(self.preview, bg=PANEL_BG, fg=HINT,
+                                     font=self.meta_font, text=READ_HINT)
+        self._hint_padding = dict(pady=(0, self.px(10)), padx=self.px(12))
+
         self.preview_text = tk.Text(
             self.preview, bg=PANEL_BG, fg=DIM, font=self.excerpt_font,
             relief="flat", bd=0, highlightthickness=0, wrap="none",
@@ -669,7 +688,38 @@ class Launcher:
 
     # -- layout ------------------------------------------------------------
 
+    def _shape(self) -> tuple:
+        """Everything the window's size and place depend on.
+
+        Worked out from what is packed rather than by asking Tk, because
+        asking means `update_idletasks`, and that is the expensive part.
+        `winfo_manager` answers immediately; `winfo_ismapped` lags a callback.
+        """
+        image = self._page_image
+        return (
+            self.tree.cget("height"),
+            bool(self.body.winfo_manager()),
+            bool(self.preview.winfo_manager()),
+            bool(self.page_view.winfo_manager()),
+            (image.width(), image.height()) if image is not None else None,
+            bool(self.status.winfo_manager()),
+            self._anim_offset,
+        )
+
     def _position(self) -> None:
+        """Put the window where it belongs, when that has changed.
+
+        Measuring needs `update_idletasks`, and during typing that flushes the
+        repaint of every row the search has just rewritten: 23ms, inside the
+        keystroke handler, on the way to computing a geometry that is almost
+        always the one already set -- 26 times out of 27, measured. So the
+        shape is derived from what is packed, and Tk is only asked when it
+        changes.
+        """
+        shape = self._shape()
+        if shape == self._shape_key:
+            return
+        self._shape_key = shape
         self.root.update_idletasks()
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
@@ -916,6 +966,8 @@ class Launcher:
             # network, so a cloud-only video keeps its still thumbnail.
             "is_video": (not is_dir) and videopreview.is_video(path)
                         and not cloud_only,
+            # Whether the expanded page view has anything to offer here.
+            "is_pdf": (not is_dir) and pdfpreview.is_pdf(path) and not cloud_only,
         }
 
     # -- the expanded page view --------------------------------------------
@@ -1093,7 +1145,9 @@ class Launcher:
                         self._extend_video(pngs)
         except queue.Empty:
             pass
-        self._drain_deep()
+        # The tight pump stops as soon as the query is answered, so a deeper
+        # answer landing after that is collected here instead.
+        self._drain_search()
         if self.alive():
             self._pump_id = self.root.after(ICON_PUMP_MS, self._pump)
 
@@ -1165,6 +1219,19 @@ class Launcher:
             self.preview_image_label.configure(image="")
             self._preview_image = None
         self.preview_meta.configure(text=info.get("meta", ""))
+
+        if info.get("is_pdf"):
+            # `winfo_manager` rather than `winfo_ismapped`: mapping lags a
+            # callback, and `before` on a widget that is not packed is an
+            # error rather than a no-op.
+            if not self.preview_hint.winfo_manager():
+                if self.preview_text.winfo_manager():
+                    self.preview_hint.pack(before=self.preview_text,
+                                           **self._hint_padding)
+                else:
+                    self.preview_hint.pack(**self._hint_padding)
+        else:
+            self.preview_hint.pack_forget()
 
         self.preview_text.configure(state="normal")
         self.preview_text.delete("1.0", "end")
@@ -1420,7 +1487,8 @@ class Launcher:
         was_visible = self._visible
         self._visible = False
         self._cancel_anim()
-        for attr in ("_after_id", "_preview_id", "_deepen_id"):
+        for attr in ("_after_id", "_preview_id", "_deepen_id",
+                     "_search_pump_id"):
             pending = getattr(self, attr)
             if pending is not None:
                 try:
@@ -1478,7 +1546,8 @@ class Launcher:
         self._busy = False
         self._cancel_anim()
         self._stop_video()
-        for attr in ("_after_id", "_spin_id", "_pump_id", "_preview_id"):
+        for attr in ("_after_id", "_spin_id", "_pump_id", "_preview_id",
+                     "_search_pump_id"):
             pending = getattr(self, attr)
             if pending is not None:
                 try:
@@ -1487,7 +1556,7 @@ class Launcher:
                     pass
                 setattr(self, attr, None)
         self._jobs.put(None)
-        self._deep_jobs.put(None)
+        self._search_jobs.put(None)
 
     def alive(self) -> bool:
         try:
@@ -1513,6 +1582,14 @@ class Launcher:
         self._sync_placeholder()
         if event.keysym in ("Up", "Down", "Return", "Escape", "Prior", "Next"):
             return
+        # What matters is whether the query changed, not whether a key moved.
+        # Releasing the space in Ctrl+Space used to arrive here and shut the
+        # page view a moment after it opened; so did releasing Ctrl itself.
+        # Caret keys and modifiers now cost nothing instead of a whole search.
+        query = self.entry.get()
+        if query == self._last_query:
+            return
+        self._last_query = query
         # Typing means the search has moved on, and the list is what answers
         # it: put the page away rather than searching behind it.
         self._close_page_view()
@@ -1537,10 +1614,93 @@ class Launcher:
         return ""
 
     def _run_search(self) -> None:
+        """Hand the query to the worker. The answer arrives on the pump.
+
+        The search used to run right here. On a 757k-entry index that is
+        5-30ms of frozen window per keystroke, and the debounce does not save
+        you: 45ms is shorter than the gap between keystrokes at any human
+        typing speed, so every character paid it.
+        """
         self._after_id = None
         self._sync_placeholder()
-        query = self.entry.get()
-        self.results, note = self.controller.query(query)
+        self._search_seq += 1
+        # A new query makes any outstanding deeper fetch pointless.
+        self._deep_seq += 1
+        self._ensure_search_worker()
+        self._search_jobs.put(("quick", self._search_seq, self.entry.get()))
+        self._start_search_pump()
+
+    def _ensure_search_worker(self) -> None:
+        if self._search_worker is None or not self._search_worker.is_alive():
+            self._search_worker = threading.Thread(
+                target=self._search_work, daemon=True, name="quickfind-search")
+            self._search_worker.start()
+
+    def _search_work(self) -> None:
+        while True:
+            job = self._search_jobs.get()
+            if job is None:
+                return
+            kind, seq, query = job
+            if kind == "quick":
+                # Typed again while this waited: nobody wants this answer.
+                if seq != self._search_seq:
+                    continue
+                try:
+                    results, note = self.controller.query(query)
+                except Exception:
+                    results, note = [], ""
+                self._search_done.put(("quick", seq, query, results, note))
+            else:
+                if seq != self._deep_seq:
+                    continue
+                try:
+                    longer = self.controller.more(query)
+                except Exception:
+                    longer = None
+                self._search_done.put(("deep", seq, query, longer))
+
+    def _search_pending(self) -> bool:
+        """Is an answer to the newest query still out?"""
+        return self._search_applied < self._search_seq
+
+    def _start_search_pump(self) -> None:
+        if self._search_pump_id is None and self.alive():
+            self._search_pump_id = self.root.after(SEARCH_PUMP_MS,
+                                                   self._pump_search)
+
+    def _pump_search(self) -> None:
+        self._search_pump_id = None
+        if not self.alive():
+            return
+        self._drain_search()
+        if self._search_pending():
+            self._start_search_pump()
+
+    def _drain_search(self) -> None:
+        """Take whatever the search worker has finished, on the UI thread."""
+        latest = None
+        deeper = []
+        try:
+            while True:
+                kind, seq, query, *rest = self._search_done.get_nowait()
+                if kind == "quick":
+                    # Even a stale answer counts as arrived, or the pump would
+                    # tick on for ever waiting for one that was dropped.
+                    self._search_applied = max(self._search_applied, seq)
+                    if seq == self._search_seq:
+                        latest = (query, rest[0], rest[1])
+                elif seq == self._deep_seq:
+                    deeper.append((query, rest[0]))
+        except queue.Empty:
+            pass
+        if latest is not None:
+            self._apply_search(*latest)
+        for query, longer in deeper:
+            self._apply_deeper(query, longer)
+
+    def _apply_search(self, query: str, results, note: str) -> None:
+        self.results = results
         # One column width for the whole result set, measured once. Deriving
         # it from whatever happens to be on screen would make the folders
         # shuffle sideways as the list scrolled.
@@ -1574,44 +1734,13 @@ class Launcher:
         self._deepen_id = self.root.after(DEEPEN_MS, self._deepen)
 
     def _deepen(self) -> None:
-        """Hand the longer search to its worker and get out of the way."""
+        """Queue the longer search behind the quick one and get out of the way."""
         self._deepen_id = None
         if not hasattr(self.controller, "more"):
             return
-        self._ensure_deep_worker()
+        self._ensure_search_worker()
         self._deep_seq += 1
-        self._deep_jobs.put((self._deep_seq, self.entry.get()))
-
-    def _ensure_deep_worker(self) -> None:
-        if self._deep_worker is None or not self._deep_worker.is_alive():
-            self._deep_worker = threading.Thread(
-                target=self._deep_work, daemon=True, name="quickfind-deepen")
-            self._deep_worker.start()
-
-    def _deep_work(self) -> None:
-        while True:
-            job = self._deep_jobs.get()
-            if job is None:
-                return
-            seq, query = job
-            # Typed again while this waited: the answer is already stale.
-            if seq != self._deep_seq:
-                continue
-            try:
-                longer = self.controller.more(query)
-            except Exception:
-                longer = None
-            self._deep_done.put((seq, query, longer))
-
-    def _drain_deep(self) -> None:
-        """Take whatever the deeper search has finished, on the UI thread."""
-        try:
-            while True:
-                seq, query, longer = self._deep_done.get_nowait()
-                if seq == self._deep_seq:
-                    self._apply_deeper(query, longer)
-        except queue.Empty:
-            pass
+        self._search_jobs.put(("deep", self._deep_seq, self.entry.get()))
 
     def _apply_deeper(self, query: str, longer) -> None:
         if not longer or query != self.entry.get():

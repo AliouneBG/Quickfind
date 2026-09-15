@@ -217,6 +217,10 @@ class Controller:
         # and rebuilding the index itself costs far more.
         self._fresh: dict[str, tuple[str, float]] = {}
         self._fresh_dirty = False
+        # Noted on the UI thread as the watcher reports, and read by the search
+        # worker while it answers a query. Without this, a file arriving during
+        # a search would change the dictionary mid-iteration.
+        self._fresh_lock = threading.Lock()
         self._fresh_at = 0.0
         self.fresh_searcher: search.Searcher | None = None
         self._drain_id = self.app.root.after(80, self._drain)
@@ -314,46 +318,55 @@ class Controller:
     def _note_fresh(self, path: str, removed: bool, is_dir: bool = False,
                     mtime: int = 0) -> None:
         key = path.lower()
-        if removed:
-            self._fresh_dirty |= self._fresh.pop(key, None) is not None
-            return
-        if key in self._fresh:
-            return
-        if len(self._fresh) >= FRESH_MAX:
-            # Insertion-ordered, so this drops the oldest.
-            self._fresh.pop(next(iter(self._fresh)))
-        self._fresh[key] = (path, bool(is_dir), int(mtime), time.time())
-        self._fresh_dirty = True
+        with self._fresh_lock:
+            if removed:
+                self._fresh_dirty |= self._fresh.pop(key, None) is not None
+                return
+            if key in self._fresh:
+                return
+            if len(self._fresh) >= FRESH_MAX:
+                # Insertion-ordered, so this drops the oldest.
+                self._fresh.pop(next(iter(self._fresh)))
+            self._fresh[key] = (path, bool(is_dir), int(mtime), time.time())
+            self._fresh_dirty = True
 
     def _refresh_fresh(self, force: bool = False) -> None:
         """Re-index the fresh paths, at most once a second unless forced.
 
         Unzipping an archive fires an event per file, and rebuilding per file
         would be wasteful. Nothing is stat'd here, because the watcher thread
-        already looked, so even a full list costs about 10ms and can stay on
-        the UI thread.
+        already looked, so even a full list costs about 10ms.
+
+        Called from two threads: the UI's own tick, and the search worker on
+        its way to answering a query, since a file that arrived seconds ago is
+        exactly what someone is looking for. The list is copied under the lock
+        and the index built outside it, so a rebuild never holds up the thread
+        noting the next change. Whichever thread clears the dirty flag does
+        the work; the other finds nothing to do.
         """
-        if not self._fresh_dirty:
-            return
-        now = time.time()
-        if not force and now - self._fresh_at < FRESH_REBUILD_SECONDS:
-            return
-        self._fresh_dirty = False
-        self._fresh_at = now
-        if not self._fresh:
+        with self._fresh_lock:
+            if not self._fresh_dirty:
+                return
+            now = time.time()
+            if not force and now - self._fresh_at < FRESH_REBUILD_SECONDS:
+                return
+            self._fresh_dirty = False
+            self._fresh_at = now
+            noted = [(path, is_dir, mtime) for path, is_dir, mtime, _at
+                     in self._fresh.values()]
+        if not noted:
             self.fresh_searcher = None
             return
-        idx = fsindex.from_paths(
-            (path, is_dir, mtime) for path, is_dir, mtime, _at
-            in self._fresh.values())
+        idx = fsindex.from_paths(noted)
         self.fresh_searcher = search.Searcher(idx, self.usage) if len(idx) else None
 
     def _forget_fresh(self, indexed_at: float) -> None:
         """Drop what the new index already holds, keeping anything newer."""
-        self._fresh = {key: value for key, value in self._fresh.items()
-                       if value[3] > indexed_at}
-        self._fresh_dirty = True
-        self._fresh_at = 0.0
+        with self._fresh_lock:
+            self._fresh = {key: value for key, value in self._fresh.items()
+                           if value[3] > indexed_at}
+            self._fresh_dirty = True
+            self._fresh_at = 0.0
         self.fresh_searcher = None
 
     def _with_fresh(self, text: str, results: list):
@@ -641,7 +654,18 @@ def bench(term: str) -> int:
     return 0
 
 
+# How long a thread may hold the interpreter before another may ask for it.
+# The default is 5ms, and with the search on a worker that is how long the
+# window can be left unable to repaint: measured while typing, 200 stalls over
+# 16ms across five words, the worst of them 48ms. At 0.5ms it is 99 stalls and
+# 27ms, and the search itself is no slower -- 89ms against 91ms for the same
+# seven queries, since the setting only costs anything when threads contend.
+# 0.2ms was worse again, 129 stalls: past some point the switching is the work.
+SWITCH_INTERVAL = 0.0005
+
+
 def main() -> int:
+    sys.setswitchinterval(SWITCH_INTERVAL)
     parser = argparse.ArgumentParser(prog="quickfind")
     parser.add_argument("--reindex", action="store_true",
                         help="rebuild the index instead of loading the cache")
