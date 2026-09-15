@@ -59,7 +59,7 @@ Undo that with `--uninstall-task`.
 | Mouse hover | Selects the row under the cursor |
 | `Enter` | Open the selection |
 | `Ctrl+Enter` | Show it in Explorer |
-| `Ctrl+Space` | Read a PDF in the window |
+| `Ctrl+Space` | Open a PDF or a picture in the window |
 | `Left` / `Right` | Turn the page, while reading |
 | `Esc` | Back to the list, then dismiss |
 
@@ -75,6 +75,10 @@ which is the difference between knowing it is a document and being able to read
 it: the pane is 234 px across and body text wants something near a real page
 width. The window takes the page's shape while it is up, `Left` and `Right`
 turn the pages, and `Esc` -- or typing anything -- gives the list back.
+
+A picture opens the same way and for the same reason, minus the paging. The
+shell renders whatever format it understands, so this covers HEIC and RAW as
+readily as JPEG.
 
 Each row ends with what the thing actually is: `App`, `Installer`, `Shortcut`,
 `Folder`, `Video`, `PDF` and so on. Searching for a media player turns up its
@@ -121,6 +125,52 @@ somewhere under a path containing `downloads`:
 ```
 report downloads
 ```
+
+Normally the first word is the one matched against the name. The exception is a
+first word too short to be worth scanning -- `a`, `my`, `the` -- where the
+longest word is matched against the name instead and the short one joins the
+path filter. Typing `a night in mondstadt` therefore finds the file of that
+name, which it did not before: `a` filled the scan cap thousands of entries
+before reaching it, and the words that identified the file never got to look.
+
+**Shortened names** work the way people say them. A word of three letters or
+fewer can match the initials of the name's words, so `vs code` finds Visual
+Studio Code and `ms word` finds Microsoft Word. Nothing in "Visual Studio Code"
+contains the letters `vs`, so without this the file was not ranked low, it was
+never a candidate at all.
+
+This is a weaker signal than the words being written out, and it is ranked that
+way: a name that says what you typed always comes first, and `code notes` still
+leads with the file called "code notes". Initials have to start the name --
+`sc code` does not find Visual Studio Code, because `s` and `c` are its second
+and third words.
+
+**Programs answer to what you call them.** `vscode`, `vs code` and `vsc` all
+find Visual Studio Code, and `googlechrome` finds Google Chrome. None of those
+is a substring of the name and only one is an initialism: `vscode` is the first
+two words shortened to their initials with the last left whole, which is how
+these are actually built -- VS + Code.
+
+So every program gets a small set of names derived that way, taking the first
+k words as initials and leaving the rest whole, for every k. Only programs:
+`.exe` and `.lnk` are 3,431 entries out of 771,070, which costs nothing, and
+doing it for every file would give a second name to a million things nobody
+calls anything. The lookup is exact rather than a substring, so `vscod` matches
+nothing through it, and single letters are excluded or every program would
+answer to one.
+
+Typing the name of a program is an exact match -- against what it is called
+rather than what it is filed as -- so it ranks with one, and what the file *is*
+separates them. That last part matters: `VSCode.admx` is a policy template, an
+exact stem match for `vscode`, and it collects full marks for being recently
+modified every time the editor updates itself. Ranking the alias any lower left
+a policy template ahead of the editor.
+
+**Words run together** match across a separator the file put there and you
+did not. A boarding pass called `Find Your Trip_ Delta Air Lines.pdf` is not
+found by `delta airlines` on substrings alone -- the file says "Air Lines" and
+neither string contains the other -- so a word that is nowhere in the path is
+also tried against the name with its separators removed.
 
 **Abbreviations** work when nothing else matches. `qckfnd` finds `quickfind`,
 and `ntpd` finds `notepad.exe`. These rank strictly below real substring matches
@@ -715,16 +765,47 @@ can improve.
    buffer in place, so it never decodes or re-lowercases a candidate.
 2. **Typing narrows.** Results for a query are always a subset of results for
    any prefix of it, so an extending query re-filters the previous candidate
-   list instead of rescanning. This is why the first word must match the name:
-   it is what makes the subset property hold.
+   list instead of rescanning. This is why one word of the query has to match
+   the name: it is what makes the subset property hold.
 3. **Vague queries scan less.** A one-character query has no useful ranking to
    offer, so its candidate pool is capped far lower than a specific one's.
+   That cap is a slice in index order rather than the best matches, which is
+   fine when the query is genuinely vague and wrong when only its first word
+   is. So a capped scan on a multi-word query is taken again on the longest
+   word, and the rest -- the original first word included -- filter by path as
+   usual. Only a capped scan pays for the second look.
+3a. **A second word can be the one in the name.** The first word is scanned
+   against names and the rest filter by path, which assumes the first word is
+   the one written on the file. Often it is not: in `vs code` the name is the
+   second word, and in `a night in mondstadt` it is the fourth. So when the
+   first word is short enough to be initials, or its scan came back capped,
+   the longest word is scanned as well and the two candidate lists merge.
+   Each candidate is then scored against whichever word is actually in its
+   name -- judging `Code.exe` by how well it matches `vs` would bury it.
+   Scanning the longest word *instead of* the first was tried and is wrong:
+   it fixes `vs code` by breaking `ui quickfind`, where the short word is the
+   filename and the long one the folder.
+
 4. **Positions, not indexes.** Converting a haystack position into an entry
    index is a binary search over a 1.4 million element array. Candidates are
    carried as positions and converted only for the few hundred results that
    reach the result pool.
 5. **Paths resolved lazily.** Rebuilding a path walks the parent chain, so it
    happens in descending score order and only until the pool is full.
+
+Two things about that fallback are easy to get wrong, and both were:
+
+* It must be told everything already found, not just the substring hits. An
+  entry reached through a program alias or a second word is a subsequence match
+  too, so it came back a second time at the guess's score and the ceiling
+  pulled the good copy down with it. The real index never showed this, because
+  it always had enough substring hits that the fallback never ran; a four-entry
+  test index found it at once.
+* Anything done only when the candidate cache misses is done only when a query
+  arrives cold. Queries are typed a character at a time and every keystroke
+  extends the last, so the cache hits every time. The second scan behind
+  `vs code` sat in that branch and therefore never ran in the launcher at all,
+  while passing every test, because tests call `search` once.
 
 Abbreviation matching runs only when substring results are sparse. It uses a
 subsequence regex whose gaps exclude the next wanted character. The obvious
@@ -749,9 +830,25 @@ rules, in rough order of weight:
    count as yours, with one exception: `AppData\Local\Programs`, where per-user
    app installs actually live. Missing that exception put the real Python
    install at rank 21, behind copies bundled inside `Downloads`.
-4. **Demotions.** `node_modules`, `__pycache__`, `site-packages`, `WinSxS`, and
-   temp directories take a heavy penalty. `SysWOW64`, the 32-bit mirror of
-   System32, and Windows' own generated shortcut folders take a mild one.
+4. **Demotions.** Somebody else's source, shipped inside something you
+   installed, takes a heavy penalty: `node_modules`, `site-packages`,
+   `__pycache__`, `WinSxS`, bundled type stubs, `vendor_perl`, editor
+   extensions and temp directories. `SysWOW64`, the 32-bit mirror of System32,
+   and Windows' own generated shortcut folders take a mild one.
+
+   That penalty is 550 and it is deliberately large, because what it has to
+   outweigh is a *strong name match*. Typing `delta` makes `delta.pyi` in a
+   bundled stub package an exact stem match worth 980, while the boarding pass
+   actually wanted merely contains the word, worth 420. At the old 260 the stub
+   won and the document sat at rank 9; at 550 the document is third, and the
+   ranking evaluation is unmoved at 13/13 anywhere between 260 and 700.
+
+   Worth knowing if you are tempted to solve this by excluding system files:
+   that is the wrong axis and it was measured. Across nineteen everyday queries
+   these vendored files were 28% of the top ten results while everything under
+   `C:\Windows` was 10% -- and most of that 10% was `cmd.exe` and `notepad.exe`,
+   which are the point rather than the problem. Five of the thirteen ranking
+   cases live in `C:\Windows`. Excluding it would break typing `cmd`.
 5. **Spreading.** Each repeat of a filename already shown costs more than the
    last, so eight vendored copies of `shared.txt` cannot bury the one file with
    a distinct name. The best copy still comes first, because spreading runs
@@ -773,6 +870,22 @@ rules, in rough order of weight:
 9. **The Start Menu is Windows' own list of installed programs**, so an entry
    there is the canonical way to launch one and is promoted accordingly.
    Uninstall entries are left where they are.
+
+Videos sit with documents in that first rule, which they did not used to. The
+extension table had no entry for one at all, so a clip scored nothing for being
+a clip and lost to every PDF on the machine -- which is what buried a video
+whose name was short enough to collide with hundreds of other things.
+
+Photos and audio were deliberately left where they are, and the reason is worth
+recording because the obvious move is the wrong one. Of the 1,047 videos on the
+development machine 93% are in Downloads, Videos or Desktop and 2% are bundled
+inside an application, almost exactly the 94% and 3% split for PDFs: carrying
+that extension really does predict that you own the file. Images do not. There
+are 22,240 of them and only 15% are the user's own, the rest being icons and
+application resources, so raising the extension would raise all of those with
+it. Audio is worse again at 6%, mostly effects shipped inside games. What tells
+a photo you took from an icon is where it lives, and the home folder bonus
+already carries that.
 
 `tests/evalset.py` measures this against real intent, asking questions like
 whether typing `cmd` puts `cmd.exe` first, so ranking changes can be compared

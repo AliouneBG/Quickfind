@@ -287,9 +287,44 @@ class IconCache:
 # Thumbnails (real file contents, for the preview pane)
 # ---------------------------------------------------------------------------
 
+# Big enough to measure a shape from, small enough to be free. The shell
+# caches thumbnails, so this is usually not even a read.
+SHAPE_PROBE = 96
+
+
+def fitted_png(path: str, box, thumbnail_only: bool = True) -> bytes | None:
+    """The largest render of ``path`` that fits inside ``box``.
+
+    A square side fits the picture inside a square of that size, so the side
+    that fills a box of a different shape depends on the picture: 1010 leaves
+    a 3840x2400 photo at 1010x631 inside an 1860x1010 window, wasting nearly
+    half the width, while filling that width would stand it 1163 tall and push
+    the window off the screen. So the shape is measured with a cheap little
+    render first and the side worked out from it, which is
+    ``longest side * however much it has to shrink to fit both ways``.
+    """
+    width, height = box
+    probe = thumbnail_png(path, SHAPE_PROBE, thumbnail_only=thumbnail_only)
+    if probe is None:
+        return None
+    try:
+        shape_w, shape_h = struct.unpack(">II", probe[16:24])
+    except struct.error:
+        return probe
+    if shape_w <= 0 or shape_h <= 0:
+        return probe
+    scale = min(width / shape_w, height / shape_h)
+    wanted = int(max(shape_w, shape_h) * scale)
+    return thumbnail_png(path, max(1, wanted), thumbnail_only=thumbnail_only)
+
+
 def thumbnail_png(path: str, size: int = 256,
                   thumbnail_only: bool = False) -> bytes | None:
     """A real thumbnail via IShellItemImageFactory, or None.
+
+    The shell scales to the width it is given, keeping the aspect ratio and
+    never enlarging past the original. So ``size`` bounds the width, not the
+    height: see `fitted_png` for filling a box of a given shape.
 
     With ``thumbnail_only`` the shell refuses to substitute a generic file-type
     icon, so the caller can tell "here is the actual picture" apart from "here

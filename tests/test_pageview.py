@@ -313,7 +313,7 @@ class TestPageView(unittest.TestCase):
             "meta": "Document\n362.5 KB\n19 Sep 2024  03:04\n7 pages",
             "excerpt": "",
             "is_video": False,
-            "is_pdf": True,
+            "expand": "pdf",
         })
         app.root.update_idletasks()
         self.assertTrue(app.preview_hint.winfo_ismapped())
@@ -347,3 +347,122 @@ class TestWorkArea(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(TK_AVAILABLE, "no display")
+class TestImagesExpandToo(unittest.TestCase):
+    """A picture wants the window for the same reason a page does.
+
+    The pane gives it 234px. The shell will render any format it understands
+    to PNG at whatever size is asked for, so the two share the view and differ
+    only in what is asked to draw them.
+    """
+
+    def setUp(self):
+        self.app = None
+
+    def tearDown(self):
+        if self.app is not None:
+            try:
+                self.app.shutdown()
+                self.app.root.destroy()
+            except Exception:
+                pass
+            self.app = None
+        gc.collect()
+
+    def launcher(self, *names):
+        rows = [Row(os.path.join(r"C:\pics", n)) for n in names]
+        app = make(lambda: ui.Launcher(Controller(rows)))
+        self.app = app
+        app.root.unbind("<FocusOut>")
+        app.show()
+        run_search(app)
+        app.root.update()
+        return app
+
+    def settle(self, app, timeout=4.0):
+        end = time.time() + timeout
+        while app._done.empty() and time.time() < end:
+            time.sleep(0.005)
+        app._pump_id = None
+        app._pump()
+        app.root.update()
+
+    def test_an_image_opens_into_the_window(self):
+        app = self.launcher("holiday.jpg")
+        with mock.patch.object(ui.shellicon, "fitted_png",
+                               return_value=PNG) as thumb:
+            app._toggle_page_view()
+            self.settle(app)
+        self.assertEqual(app._page_path, os.path.join(r"C:\pics", "holiday.jpg"))
+        self.assertEqual(app._page_kind, "image")
+        self.assertTrue(app.page_view.winfo_ismapped())
+        thumb.assert_called()
+
+    def test_it_is_drawn_through_the_shell_not_the_pdf_renderer(self):
+        app = self.launcher("holiday.png")
+        with mock.patch.object(ui.shellicon, "fitted_png",
+                               return_value=PNG), \
+             mock.patch.object(ui.pdfpreview, "render_page") as render:
+            app._toggle_page_view()
+            self.settle(app)
+        render.assert_not_called()
+
+    def test_it_is_asked_for_a_size_that_fits_the_window(self):
+        app = self.launcher("holiday.jpg")
+        with mock.patch.object(ui.shellicon, "fitted_png",
+                               return_value=PNG) as thumb:
+            app._toggle_page_view()
+            self.settle(app)
+        # It is handed the whole box and works the rest out from the picture.
+        box = thumb.call_args.args[1]
+        self.assertEqual(box, app._page_box())
+        self.assertGreater(min(box), app.preview_width)
+
+    def test_a_picture_offers_no_pages_to_turn(self):
+        app = self.launcher("holiday.jpg")
+        with mock.patch.object(ui.shellicon, "fitted_png",
+                               return_value=PNG):
+            app._toggle_page_view()
+            self.settle(app)
+        self.assertEqual(app._page_count, 1)
+        self.assertNotIn("of", app.page_foot.cget("text"))
+        app._turn_page(1)
+        self.assertEqual(app._page_index, 0)
+
+    def test_escape_closes_it_like_a_page(self):
+        app = self.launcher("holiday.jpg")
+        with mock.patch.object(ui.shellicon, "fitted_png",
+                               return_value=PNG):
+            app._toggle_page_view()
+            self.settle(app)
+        app._on_escape()
+        self.assertIsNone(app._page_path)
+        self.assertTrue(app.is_visible())
+
+    def test_an_image_the_shell_will_not_draw_says_so(self):
+        app = self.launcher("broken.jpg")
+        with mock.patch.object(ui.shellicon, "fitted_png",
+                               return_value=None):
+            app._toggle_page_view()
+            self.settle(app)
+        self.assertIn("cannot", app.page_label.cget("text"))
+
+    def test_the_pane_offers_the_right_words(self):
+        app = self.launcher("holiday.jpg")
+        self.assertEqual(
+            app._expandable_kind(os.path.join(r"C:\pics", "holiday.jpg"),
+                                 False, False), "image")
+        self.assertEqual(
+            app._expandable_kind(os.path.join(r"C:\docs", "a.pdf"),
+                                 False, False), "pdf")
+        self.assertEqual(
+            app._expandable_kind(os.path.join(r"C:\v", "a.mp4"),
+                                 False, False), "")
+        # A folder, and a file that is only in the cloud: reading one of those
+        # would pull the whole thing down over the network.
+        self.assertEqual(app._expandable_kind(r"C:\pics", True, False), "")
+        self.assertEqual(
+            app._expandable_kind(os.path.join(r"C:\pics", "a.jpg"),
+                                 False, True), "")

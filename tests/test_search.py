@@ -272,3 +272,304 @@ class TestWalkerAndCache(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestShortLeadingWord(unittest.TestCase):
+    """A short first word must not swallow the whole scan.
+
+    The first token is the one scanned against the name haystack, and a one
+    or two character token caps at the first few thousand hits in index
+    order. That slice is arbitrary, so the words that would actually identify
+    the file only got to filter whatever the short word happened to collect.
+    Reported from a real search: typing the full, exact name of a file
+    beginning "A Night in ..." returned nothing at all.
+    """
+
+    def setUp(self):
+        # Enough decoys containing "a" to cap the scan for real, with the
+        # wanted file last so an index-order slice cannot include it.
+        paths = [rf"C:\noise\padding{n:05d}a.txt"
+                 for n in range(search.MAX_SCAN_HITS + 200)]
+        paths.append(r"C:\music\A Night in Mondstadt.flac")
+        self.searcher = search.Searcher(make_index(paths))
+        self.want = r"c:\music\a night in mondstadt.flac"
+
+    def rank(self, query):
+        self.searcher._last_hits = None
+        self.searcher._last_primary = ""
+        rows = self.searcher.search(query, 200, fuzzy=False)
+        for n, row in enumerate(rows, 1):
+            if row.path.lower() == self.want:
+                return n
+        return None
+
+    def test_the_exact_name_finds_the_file(self):
+        self.assertEqual(self.rank("a night in mondstadt"), 1)
+
+    def test_a_short_first_word_still_finds_it(self):
+        self.assertIsNotNone(self.rank("a night"))
+
+    def test_either_order_works(self):
+        self.assertIsNotNone(self.rank("night a"))
+        self.assertIsNotNone(self.rank("a mondstadt"))
+
+    def test_a_specific_first_word_is_left_alone(self):
+        # "mondstadt" does not cap, so nothing is promoted and the ordinary
+        # reading -- first word names the file, the rest filter the path --
+        # is untouched.
+        self.assertEqual(self.rank("mondstadt night"), 1)
+
+    def test_a_repeated_word_still_filters(self):
+        # Only the promoted occurrence leaves `rest`; the other must remain.
+        self.assertIsNotNone(self.rank("a night a"))
+
+    def test_a_word_that_is_not_there_still_excludes(self):
+        # Promotion must not turn the other words into decoration.
+        self.assertIsNone(self.rank("a night liyue"))
+
+
+class TestInitialsMatching(unittest.TestCase):
+    """People shorten the names of things they use every day.
+
+    "vs code" for Visual Studio Code, "ms word" for Microsoft Word. Nothing in
+    "Visual Studio Code" contains the substring "vs", so no amount of ranking
+    reaches it -- the file was not scored low, it was never a candidate.
+    """
+
+    def setUp(self):
+        self.paths = [
+            r"C:\Users\me\AppData\Local\Programs\Visual Studio Code.lnk",
+            r"C:\Users\me\Documents\code notes.txt",
+            r"C:\Users\me\Projects\VeryStrangeCode.txt",
+            r"C:\Windows\System32\notepad.exe",
+        ]
+        self.searcher = search.Searcher(make_index(self.paths))
+
+    def ranked(self, query, limit=40):
+        self.searcher._last_hits = None
+        self.searcher._last_primary = ""
+        return [r.path for r in self.searcher.search(query, limit)]
+
+    def test_initials_find_what_no_substring_could(self):
+        rows = self.ranked("vs code")
+        self.assertIn(self.paths[0], rows)
+
+    def test_spelling_it_out_still_works(self):
+        self.assertIn(self.paths[0], self.ranked("visual code"))
+        self.assertIn(self.paths[0], self.ranked("studio code"))
+
+    def test_a_name_that_says_it_outright_comes_first(self):
+        # The caution that matters: initials are a weaker signal than the
+        # words being there, so they must not outrank them.
+        rows = self.ranked("code notes")
+        self.assertEqual(rows[0], self.paths[1])
+
+    def test_initials_do_not_match_the_middle_of_a_name(self):
+        # "sc" are initials two and three of Visual Studio Code, not one and
+        # two, so this must not match it.
+        self.assertNotIn(self.paths[0], self.ranked("sc code"))
+
+    def test_a_word_that_is_absent_still_excludes(self):
+        self.assertNotIn(self.paths[0], self.ranked("vs code python"))
+
+    def test_camel_case_reads_as_words(self):
+        self.assertIn(self.paths[2], self.ranked("vs code"))
+
+
+class TestInitialsOfAName(unittest.TestCase):
+    def test_spaces_and_separators(self):
+        self.assertEqual(search._initials("Visual Studio Code.lnk"), "vsc")
+        self.assertEqual(search._initials("my_report_final.docx"), "mrf")
+        self.assertEqual(search._initials("Google Chrome.lnk"), "gc")
+
+    def test_camel_humps(self):
+        self.assertEqual(search._initials("VisualStudioCode.exe"), "vsc")
+
+    def test_the_extension_is_not_a_word(self):
+        self.assertEqual(search._initials("notepad.exe"), "n")
+
+    def test_a_leading_dot_is_part_of_the_name(self):
+        self.assertEqual(search._initials(".gitignore"), "g")
+
+
+class TestTypedNotPasted(unittest.TestCase):
+    """Queries arrive a character at a time, and that is a different path.
+
+    Every keystroke extends the previous one, so the refinement cache hits and
+    the haystack is never rescanned. Anything done only on a cache miss is
+    therefore done only when a query is issued cold -- which is how tests call
+    it and not how anybody types. The second scan behind "vs code" lived in
+    that branch and did nothing in the real launcher for exactly that reason.
+    """
+
+    def setUp(self):
+        self.paths = [
+            r"C:\Users\me\AppData\Local\Programs\Visual Studio Code.lnk",
+            r"C:\Users\me\Projects\vscode.proposed.d.ts",
+            r"C:\Users\me\Projects\vscode.notes.txt",
+            r"C:\Windows\System32\notepad.exe",
+        ]
+        self.index = make_index(self.paths)
+
+    def typed(self, query, limit=40):
+        """Search the way the window does: one character at a time."""
+        searcher = search.Searcher(self.index)
+        rows = []
+        for cut in range(1, len(query) + 1):
+            rows = searcher.search(query[:cut], limit)
+        return [r.path for r in rows]
+
+    def pasted(self, query, limit=40):
+        searcher = search.Searcher(self.index)
+        return [r.path for r in searcher.search(query, limit)]
+
+    def test_initials_work_when_the_query_is_typed(self):
+        self.assertIn(self.paths[0], self.typed("vs code"))
+
+    def test_typing_and_pasting_agree(self):
+        for query in ("vs code", "vscode notes", "notepad"):
+            with self.subTest(query=query):
+                self.assertEqual(set(self.typed(query)), set(self.pasted(query)))
+
+
+class TestProgramAliases(unittest.TestCase):
+    """People type what they call a program, not what it is called on disk.
+
+    "vscode" is not an initialism -- that would be "vsc" -- and it is not a
+    substring of "Visual Studio Code" either. It is the first two words
+    shortened to their initials with the last one left whole, which is how
+    these are actually built: VS + Code.
+    """
+
+    def setUp(self):
+        self.paths = [
+            r"C:\Users\me\AppData\Roaming\Start Menu\Programs\Visual Studio Code.lnk",
+            r"C:\Users\me\AppData\Local\Programs\VS Code\policies\VSCode.admx",
+            r"C:\Users\me\Notes\vscode tips.txt",
+            r"C:\Program Files\Google\Google Chrome.lnk",
+        ]
+        self.index = make_index(self.paths)
+
+    def typed(self, query, limit=40):
+        searcher = search.Searcher(self.index)
+        rows = []
+        for cut in range(1, len(query) + 1):
+            rows = searcher.search(query[:cut], limit)
+        return [r.path for r in rows]
+
+    def test_the_collapsed_form_finds_the_program(self):
+        self.assertEqual(self.typed("vscode")[0], self.paths[0])
+
+    def test_so_does_the_spaced_form(self):
+        self.assertEqual(self.typed("vs code")[0], self.paths[0])
+
+    def test_and_the_bare_initials(self):
+        self.assertEqual(self.typed("vsc")[0], self.paths[0])
+
+    def test_the_whole_name_run_together(self):
+        self.assertEqual(self.typed("googlechrome")[0], self.paths[3])
+
+    def test_a_program_beats_a_file_that_merely_spells_it(self):
+        # VSCode.admx is an exact stem match for "vscode" and still must not
+        # win: a policy template is not what anybody means by "vscode".
+        rows = self.typed("vscode")
+        self.assertLess(rows.index(self.paths[0]), rows.index(self.paths[1]))
+
+    def test_only_programs_are_aliased(self):
+        # A text file called "vscode tips" keeps its ordinary substring match
+        # and gains no alias of its own.
+        forms = search._alias_forms("vscode tips.txt")
+        self.assertIn("vscodetips", forms)
+        searcher = search.Searcher(self.index)
+        self.assertNotIn("vt", searcher._aliases)
+
+    def test_an_alias_is_an_exact_lookup_not_a_substring(self):
+        # "vscod" is a prefix of the alias and must not match through it.
+        searcher = search.Searcher(self.index)
+        self.assertIn("vscode", searcher._aliases)
+        self.assertNotIn("vscod", searcher._aliases)
+
+    def test_single_letters_are_not_aliases(self):
+        # Every name would otherwise answer to one letter.
+        self.assertNotIn("v", search._alias_forms("Visual Studio Code.lnk"))
+        self.assertNotIn("n", search._alias_forms("notepad.exe"))
+
+
+class TestWordsRunTogether(unittest.TestCase):
+    """People do not put the spaces where the file does.
+
+    A boarding pass called "Find Your Trip_ Delta Air Lines.pdf" was not found
+    by "delta airlines": the file says "Air Lines" and the query says
+    "airlines", and neither is a substring of the other anywhere in the path.
+    """
+
+    def setUp(self):
+        self.paths = [
+            r"C:\Users\me\Desktop\Find Your Trip_ Delta Air Lines.pdf",
+            r"C:\Users\me\Desktop\United Airlines booking.pdf",
+            r"C:\Users\me\Desktop\notes.txt",
+        ]
+        self.index = make_index(self.paths)
+
+    def typed(self, query, limit=40):
+        searcher = search.Searcher(self.index)
+        rows = []
+        for cut in range(1, len(query) + 1):
+            rows = searcher.search(query[:cut], limit)
+        return [r.path for r in rows]
+
+    def test_a_word_split_in_the_name_still_matches(self):
+        self.assertIn(self.paths[0], self.typed("delta airlines"))
+
+    def test_the_spaced_form_still_matches(self):
+        self.assertIn(self.paths[0], self.typed("delta air"))
+
+    def test_it_does_not_match_across_unrelated_files(self):
+        rows = self.typed("delta airlines")
+        self.assertNotIn(self.paths[1], rows)
+        self.assertNotIn(self.paths[2], rows)
+
+    def test_squashing_keeps_only_letters_and_digits(self):
+        self.assertEqual(search._squashed("Find Your Trip_ Delta Air Lines.pdf"),
+                         "findyourtripdeltaairlinespdf")
+        self.assertEqual(search._squashed("report-2024_final.docx"),
+                         "report2024finaldocx")
+
+
+class TestVendoredCodeIsDemoted(unittest.TestCase):
+    r"""Somebody else's source, shipped inside something you installed.
+
+    Measured across nineteen everyday queries these were 28% of the top ten
+    results, and typing "delta" returned eight of them against one real file.
+    They are neither system files nor yours, which is why looking only at
+    C:\Windows found almost nothing wrong.
+    """
+
+    def setUp(self):
+        self.mine = r"C:\Users\me\Desktop\Find Your Trip_ Delta Air Lines.pdf"
+        self.stub = (r"C:\Users\me\.vscode\extensions\pylance\dist"
+                     r"\bundled\stubs\sympy-stubs\delta.pyi")
+        searcher = search.Searcher(make_index([self.mine, self.stub]))
+        searcher._home = r"c:\users\me" + "\\"
+        self.searcher = searcher
+
+    def ranked(self, query, limit=40):
+        self.searcher._last_hits = None
+        self.searcher._last_primary = ""
+        return [r.path for r in self.searcher.search(query, limit)]
+
+    def test_your_own_file_beats_a_bundled_stub(self):
+        # delta.pyi is an exact stem match for "delta", worth far more on name
+        # alone; being vendored is what has to outweigh that.
+        rows = self.ranked("delta")
+        self.assertLess(rows.index(self.mine), rows.index(self.stub))
+
+    def test_the_stub_is_demoted_not_hidden(self):
+        self.assertIn(self.stub, self.ranked("delta"))
+
+    def test_the_directories_that_were_missing_are_covered(self):
+        for marker in (r"\bundled\stubs" + "\\", r"\vendor_perl" + "\\",
+                       r"\typeshed-fallback" + "\\",
+                       r"\.vscode\extensions" + "\\"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, search.NOISE)

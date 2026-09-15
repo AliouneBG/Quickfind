@@ -18,6 +18,7 @@ from .usage import OPEN_WEIGHT, REVEAL_WEIGHT
 PLACEHOLDER = "Search anything"
 # Nobody guesses a shortcut. The pane says so, where you are already looking.
 READ_HINT = "Ctrl+Space to read"
+VIEW_HINT = "Ctrl+Space to view"
 
 BG = "#1b1c22"
 FG = "#f2f3f7"
@@ -397,6 +398,7 @@ class Launcher:
         self._page_count = 0
         self._page_token = 0
         self._page_image = None
+        self._page_kind = "pdf"
         self._last_query = ""
         self._shape_key = None
         self._preview_token = 0
@@ -907,10 +909,15 @@ class Launcher:
                     # the thing on screen; not fine indefinitely afterwards.
                     pdfpreview.close_open_document()
                 elif kind == "page":
-                    _, token, path, index, box = job
+                    _, token, path, index, box, wanted = job
                     if token != self._page_token:
                         continue
-                    png, count = pdfpreview.render_page(path, index, box=box)
+                    if wanted == "image":
+                        png = shellicon.fitted_png(path, box)
+                        count = 1 if png else 0
+                    else:
+                        png, count = pdfpreview.render_page(path, index,
+                                                            box=box)
                     self._done.put(("page", token, png, count))
                 elif kind == "preview":
                     _, token, path, is_dir = job
@@ -946,6 +953,17 @@ class Launcher:
             except Exception:
                 pass
 
+    @staticmethod
+    def _expandable_kind(path: str, is_dir: bool, cloud_only: bool) -> str:
+        """"pdf", "image", or "" -- reading a cloud placeholder downloads it."""
+        if is_dir or cloud_only:
+            return ""
+        if pdfpreview.is_pdf(path):
+            return "pdf"
+        if kinds.kind_of(os.path.basename(path), False) == kinds.IMAGE:
+            return "image"
+        return ""
+
     def _build_preview_data(self, path: str, is_dir: bool) -> dict:
         image = None
         if not is_dir:
@@ -974,8 +992,8 @@ class Launcher:
             # network, so a cloud-only video keeps its still thumbnail.
             "is_video": (not is_dir) and videopreview.is_video(path)
                         and not cloud_only,
-            # Whether the expanded page view has anything to offer here.
-            "is_pdf": (not is_dir) and pdfpreview.is_pdf(path) and not cloud_only,
+            # Which of the two the expanded view would draw here, if either.
+            "expand": self._expandable_kind(path, is_dir, cloud_only),
         }
 
     # -- the expanded page view --------------------------------------------
@@ -1000,26 +1018,39 @@ class Launcher:
             return max(self.px(MIN_WIDTH), min(self.width, wanted))
         return self.width
 
-    def _pdf_at_cursor(self):
+    def _expandable_at_cursor(self):
+        """What the selected row can be opened as, if anything.
+
+        A page and a picture want the same thing from the window -- all of it,
+        rather than a 234px column -- so they share the view and differ only
+        in what is asked to draw them.
+        """
         index = self._selected()
         if index < 0:
-            return None
-        path = self.results[index].path
-        return path if pdfpreview.is_pdf(path) else None
+            return None, None
+        row = self.results[index]
+        if row.is_dir:
+            return None, None
+        if pdfpreview.is_pdf(row.path):
+            return row.path, "pdf"
+        if kinds.kind_of(row.name, False) == kinds.IMAGE:
+            return row.path, "image"
+        return None, None
 
     def _toggle_page_view(self, _event=None) -> str:
         if self._page_path is not None:
             self._close_page_view()
             return "break"
-        path = self._pdf_at_cursor()
+        path, kind = self._expandable_at_cursor()
         if path is not None:
-            self._open_page_view(path)
+            self._open_page_view(path, kind)
         return "break"
 
-    def _open_page_view(self, path: str) -> None:
+    def _open_page_view(self, path: str, kind: str = "pdf") -> None:
         # A clip playing behind the page would go on decoding for nothing.
         self._stop_video()
         self._page_path = path
+        self._page_kind = kind
         self._page_index = 0
         self._page_count = 0
         self._page_image = None
@@ -1103,7 +1134,7 @@ class Launcher:
         self._page_token += 1
         self._ensure_worker()
         self._jobs.put(("page", self._page_token, self._page_path,
-                        self._page_index, self._page_box()))
+                        self._page_index, self._page_box(), self._page_kind))
 
     def _show_page(self, png, count: int) -> None:
         self._page_count = count
@@ -1234,7 +1265,10 @@ class Launcher:
             self._preview_image = None
         self.preview_meta.configure(text=info.get("meta", ""))
 
-        if info.get("is_pdf"):
+        expand = info.get("expand")
+        if expand:
+            self.preview_hint.configure(
+                text=READ_HINT if expand == "pdf" else VIEW_HINT)
             # `winfo_manager` rather than `winfo_ismapped`: mapping lags a
             # callback, and `before` on a widget that is not packed is an
             # error rather than a no-op.

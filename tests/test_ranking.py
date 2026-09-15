@@ -231,3 +231,49 @@ class TestInstallersAndLaunchers(unittest.TestCase):
     def test_a_folder_named_setup_is_not_an_installer(self):
         s = searcher_for([r"C:\Users\me\projects\setup\notes.txt"])
         self.assertTrue(ranked(s, "setup"))
+
+
+class TestVideoIsUserContent(unittest.TestCase):
+    """A video was worth nothing for being a video.
+
+    The extension table had no entry for one, so a clip scored zero on kind
+    while every PDF on the machine scored 30 -- which is what buried a video
+    with a short, ambiguous name. Measured on the development machine, videos
+    are as much the user's own as documents are: 93% of them sit in Downloads,
+    Videos or Desktop against 94% of PDFs, and 2% are bundled inside an
+    application against 3%.
+    """
+
+    def test_a_video_is_worth_as_much_as_a_document(self):
+        paths = [rf"{HOME}\Videos\ja.mp4", rf"{HOME}\Documents\ja.pdf"]
+        s = searcher_for(paths)
+        rows = ranked(s, "ja")
+        self.assertEqual(len(rows), 2)
+        # Neither buries the other now; before, the document always won.
+        self.assertEqual(sorted(rows), sorted(paths))
+
+    def test_a_video_outranks_a_file_of_no_known_kind(self):
+        paths = [rf"{HOME}\Videos\holiday.mp4", rf"{HOME}\Videos\holiday.dat"]
+        rows = ranked(searcher_for(paths), "holiday")
+        self.assertEqual(rows[0], rf"{HOME}\Videos\holiday.mp4")
+
+    def test_every_common_container_counts(self):
+        for ext in ("mp4", "mkv", "mov", "avi", "webm", "m4v"):
+            with self.subTest(ext=ext):
+                paths = [rf"{HOME}\Videos\clip.{ext}",
+                         rf"{HOME}\Videos\clip.dat"]
+                rows = ranked(searcher_for(paths), "clip")
+                self.assertEqual(rows[0], rf"{HOME}\Videos\clip.{ext}")
+
+    def test_an_executable_still_wins(self):
+        # Video was raised to a document's weight, not above a launcher's.
+        paths = [rf"{HOME}\Videos\thing.mp4", rf"{HOME}\Apps\thing.exe"]
+        rows = ranked(searcher_for(paths), "thing")
+        self.assertEqual(rows[0], rf"{HOME}\Apps\thing.exe")
+
+    def test_photos_and_audio_were_deliberately_left_alone(self):
+        # 15% of images and 6% of audio on the machine are the user's own; the
+        # rest are icons and bundled effects. Raising them raises those too,
+        # and where a photo lives is what tells it from an icon.
+        self.assertLess(search.EXT_BONUS[b"png"], search.EXT_BONUS[b"mp4"])
+        self.assertNotIn(b"mp3", search.EXT_BONUS)

@@ -5,6 +5,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -355,3 +356,62 @@ class TestPreviewPane(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestFittingAPictureToABox(unittest.TestCase):
+    """The shell fits a picture inside a square of the side it is given.
+
+    Which means no single number describes a box of a different shape, and
+    the side that fills one depends on the picture. Asking for the smaller
+    side leaves a wide photo using half the width; asking for the larger one
+    stands it taller than the window. Both were measured before this existed.
+    """
+
+    @staticmethod
+    def fitted(shape, box):
+        """What fitted_png would ask for, given a picture of this shape."""
+        shape_w, shape_h = shape
+        scale = min(box[0] / shape_w, box[1] / shape_h)
+        side = int(max(shape_w, shape_h) * scale)
+        # What the shell then does with that side: fit inside side x side,
+        # never enlarging.
+        grow = min(side / shape_w, side / shape_h, 1.0)
+        return int(shape_w * grow), int(shape_h * grow)
+
+    def assert_fits(self, shape, box):
+        width, height = self.fitted(shape, box)
+        self.assertLessEqual(width, box[0],
+                             "{} too wide for {}".format(shape, box))
+        self.assertLessEqual(height, box[1],
+                             "{} too tall for {}".format(shape, box))
+        return width, height
+
+    def test_nothing_ever_overflows_the_box(self):
+        box = (1860, 1010)
+        for shape in ((3840, 2400), (600, 2400), (3000, 500), (1600, 1600),
+                      (80, 60), (1, 4000), (4000, 1)):
+            with self.subTest(shape=shape):
+                self.assert_fits(shape, box)
+
+    def test_a_wide_photo_uses_the_width(self):
+        # The case that started it: 1010x631 before, against a 1860 wide box.
+        width, height = self.assert_fits((3840, 2400), (1860, 1010))
+        self.assertEqual((width, height), (1616, 1010))
+
+    def test_a_tall_photo_uses_the_height(self):
+        # And the bug found while fixing that one: this came back 63x252.
+        width, height = self.assert_fits((600, 2400), (1860, 1010))
+        self.assertEqual(height, 1010)
+        self.assertGreater(width, 250)
+
+    def test_a_small_picture_is_not_blown_up(self):
+        self.assertEqual(self.fitted((80, 60), (1860, 1010)), (80, 60))
+
+    def test_it_survives_a_shell_that_answers_nothing(self):
+        with mock.patch.object(shellicon, "thumbnail_png", return_value=None):
+            self.assertIsNone(shellicon.fitted_png(r"C:\x\a.jpg", (900, 900)))
+
+    def test_a_truncated_answer_is_passed_through_rather_than_crashing(self):
+        with mock.patch.object(shellicon, "thumbnail_png", return_value=b"tiny"):
+            self.assertEqual(shellicon.fitted_png(r"C:\x\a.jpg", (900, 900)),
+                             b"tiny")
