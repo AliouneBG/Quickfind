@@ -61,7 +61,14 @@ class UsageStore:
             return
         if not isinstance(stored, dict):
             return
-        for key, value in stored.get("entries", {}).items():
+        entries = stored.get("entries", {})
+        if not isinstance(entries, dict):
+            # The file is guarded above, but not what is inside it: a truncated
+            # or hand-edited store with `entries` as anything else raised here,
+            # and this runs while the Controller is being built, so it took the
+            # whole launcher down rather than costing a little history.
+            return
+        for key, value in entries.items():
             try:
                 weight, last = float(value[0]), float(value[1])
             except (TypeError, ValueError, IndexError):

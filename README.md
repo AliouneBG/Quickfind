@@ -92,6 +92,14 @@ and invites scrolling; when there are more than the list can hold it reads
 folder and usually cuts the list to one. The invitation to scroll is dropped
 once you reach the last row, since by then there is nothing more to scroll to.
 
+A second word cannot report a total, because counting the matches for one means
+resolving and filtering every candidate rather than stopping at the limit --
+which is the cost the whole design avoids. It reports `2,000+ matches` instead:
+filling the request exactly is itself proof there is probably more behind it.
+Without that, a two-word query that filled the list read as `2000 matches`,
+indistinguishable from a file count that happens to be exactly 2000, and
+scrolling to the bottom of it looked exactly like reaching the end.
+
 The tray icon has Show, Rebuild index, and Quit. On Windows 11 new tray icons
 start hidden behind the `^` chevron, so drag it out if you want it pinned.
 
@@ -173,6 +181,23 @@ file automatically, so the file always shows everything available.
 | `min_rebuild_seconds` | `90` | Minimum gap between rebuilds |
 | `refresh_after_hours` | `12` | Rebuild a cached index older than this |
 
+### A hand-edited config cannot stop it starting
+
+Settings are checked against the type of their default before they are used,
+and anything that does not fit is ignored with a line in the log and a note on
+stderr. This is not defensive programming for its own sake: the file is meant
+to be edited by hand, and the failures were bad out of proportion to the
+mistake. `roots` written as `"C:\\"` rather than `["C:\\"]` indexed `C`, `:`
+and `\` as three separate drives and reported nothing wrong. A string where a
+number belonged took the process down on the first keystroke, and valid JSON
+that was not an object -- a list, a number, `null` -- took it down before the
+window ever appeared. Launched through `pythonw` there is no console, so all of
+that looked identical to the app simply not starting.
+
+The file is also written through a temporary and moved into place, as the usage
+store already was. Written where it lies, an interrupted write leaves truncated
+JSON, which is exactly the corruption above.
+
 ## Administrator mode
 
 Two features need elevation, because both read the NTFS volume directly rather
@@ -193,6 +218,11 @@ Watching it keeps the index fresh without rescanning the disk.
 | Build time | 42.5 s | 10.7 s |
 | Live updates | no | yes |
 | Worst keystroke | 17 to 28 ms | 40 to 50 ms |
+
+These are one machine on one day, and they drift: re-running the MFT
+self-test later gave 1,382,053 entries in 20.7 s cold and 13.7 s warm, on the
+same machine with a fuller disk. Treat the shape of the comparison as the
+point, not the digits.
 
 Note that elevated mode searches slower. It indexes nearly twice as many files,
 most of them Windows internals you will never search for, which makes every
@@ -266,10 +296,19 @@ on-disk cache is 53 MB.
 
 ### Threading
 
-The Controller owns a `queue.Queue`. Every background thread, meaning the
-indexer, tray, hotkey listener, change watcher, and single-instance listener,
-posts to that queue. A Tk `after` loop drains it on the UI thread. No Tk call
-ever happens off that thread.
+The Controller owns a `queue.Queue`. The indexer, tray, hotkey listener,
+change watcher and single-instance listener all post to it, and a Tk `after`
+loop drains it on the UI thread.
+
+The window owns two more, for work it starts itself: one shell worker for icons,
+thumbnails, previews and PDF pages, and one search worker. Their answers are
+drained on the UI thread the same way, the shell worker's on a 50 ms tick and
+the search worker's on a 4 ms one that only runs while a search is out.
+
+No Tk call ever happens off the UI thread. That is the invariant to preserve
+when moving anything else onto a worker: the search worker reaches the
+Controller, which reaches the index and the fresh-file list, and none of that
+touches Tk.
 
 ### How the index is stored
 
@@ -411,8 +450,10 @@ skip is still there, since it is free, but it was not the problem.
 Resolving a path is what a result costs, so a search that materialises two
 thousand of them spends about 10 ms more than one that stops at four hundred.
 Almost every query is refined again before anyone scrolls, so a keystroke
-fetches four hundred and the rest follows 120 ms after typing stops, cancelled
-if another key arrives.
+fetches four hundred and the rest follows 350 ms after typing stops, cancelled
+if another key arrives. That delay is longer than the gap between keystrokes at
+any human typing speed, which is the point: at 120 ms it ran between every pair
+of them and every answer was thrown away by the next character.
 
 The deeper search is not swapped in wholesale. It interleaves repeated names
 over a larger pool, so its order differs from the quick one's, and replacing
@@ -477,10 +518,32 @@ view asks for a page as large as the work area allows and the window takes the
 page's shape while it is up -- a portrait page in a window sized for a results
 list is a column of paper with a third of the window empty either side.
 
-Each turn re-opens the document, which is why a page costs 73 ms rather than
-the 10 ms it would if the handle were kept. Keeping WinRT objects alive across
-turns would mean owning their lifetime on the worker thread; at 73 ms a turn
-this has not been worth it.
+**The document is kept open between page turns, and not for speed.** It was
+worth writing down why, because the obvious reason turned out to be wrong. The
+guess here was that re-opening the file was what made a page cost 73 ms, and
+that keeping it open would bring that down to about 10 ms. Caching it proved
+otherwise: with the document already open a page still costs 73.1 ms, of which
+72.8 ms is the render itself. Opening the file is nearly free, and this
+paragraph previously said the opposite.
+
+What keeping it open does fix is a handle leak. `GetFileFromPathAsync` leaks
+one process handle per call, and the leak is inside Windows.Storage rather than
+here: 300 opens took the process from 292 handles to 567, exactly one each,
+and it never plateaus. Releasing the `StorageFile`, closing it through
+`IClosable`, and letting the calling thread and its apartment die were all
+measured and none of them reclaim it. So reading a ten page document cost ten
+handles and now costs one.
+
+The cache holds an apartment reference of its own, since `RoUninitialize`
+dropping the last one would invalidate every pointer it is keeping, and it is
+only ever used from the thread that filled it -- the one shell worker -- so
+those pointers never cross an apartment.
+
+The document does not stay open indefinitely. It keeps the file memory-mapped,
+which is harmless for renaming or deleting, both of which were tested and work,
+but stops anything truncating the file where it lies. So it is dropped as soon
+as the selection moves to something that is not a PDF, and when the launcher is
+dismissed.
 
 Two things worth knowing if you touch it:
 
@@ -721,7 +784,7 @@ hold on any machine.
 ## Development
 
 ```sh
-python -m unittest discover -s tests     # 466 tests
+python -m unittest discover -s tests     # 585 tests
 python quickfind.py --bench report       # time a query
 python quickfind.py --selftest-mft       # verify MFT enumeration (needs admin)
 ```

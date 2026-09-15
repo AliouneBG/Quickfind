@@ -280,3 +280,79 @@ class TestPreviewPane(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestOpenDocumentIsReused(unittest.TestCase):
+    """Turning a page must not re-open the file.
+
+    GetFileFromPathAsync leaks one process handle per call, inside
+    Windows.Storage rather than here: measured, 300 opens took the process
+    from 292 handles to 567, exactly one each, and it never plateaus.
+    Releasing the StorageFile, closing it through IClosable and letting the
+    thread's apartment die all fail to reclaim it. So the document is kept
+    open, and a ten page read costs one handle instead of ten.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "doc.pdf")
+        write_pdf(self.path, pages=3)
+        pdfpreview.close_open_document()
+
+    def tearDown(self):
+        pdfpreview.close_open_document()
+        self.tmp.cleanup()
+
+    def test_a_second_page_does_not_reopen_the_file(self):
+        first, pages = pdfpreview.render_page(self.path, 0, box=(200, 200))
+        if first is None:
+            self.skipTest("this machine will not render the sample")
+        self.assertEqual(pages, 3)
+        # `_render` opens the temporary file it draws into through the same
+        # helper, so watch which paths it is asked for rather than blocking it.
+        opened = []
+        real = pdfpreview._storage_file
+
+        def spy(statics, path):
+            opened.append(path)
+            return real(statics, path)
+
+        with mock.patch.object(pdfpreview, "_storage_file", spy):
+            second, again = pdfpreview.render_page(self.path, 1, box=(200, 200))
+        self.assertIsNotNone(second)
+        self.assertEqual(again, 3)
+        self.assertNotIn(self.path, opened)
+
+    def test_a_different_document_is_opened_fresh(self):
+        other = os.path.join(self.tmp.name, "other.pdf")
+        write_pdf(other, pages=1)
+        if pdfpreview.render_page(self.path, 0, box=(200, 200))[0] is None:
+            self.skipTest("this machine will not render the sample")
+        png, pages = pdfpreview.render_page(other, 0, box=(200, 200))
+        self.assertIsNotNone(png)
+        self.assertEqual(pages, 1)
+
+    def test_a_rewritten_file_is_not_served_from_the_cache(self):
+        if pdfpreview.render_page(self.path, 0, box=(200, 200))[1] != 3:
+            self.skipTest("this machine will not render the sample")
+        time.sleep(0.01)
+        # Written beside and moved into place, the way a careful program saves
+        # -- and the way this has to be done here, because the open document
+        # keeps the file mapped and nothing may truncate it where it lies.
+        replacement = self.path + ".new"
+        write_pdf(replacement, pages=1)
+        os.replace(replacement, self.path)
+        self.assertEqual(pdfpreview.render_page(self.path, 0, box=(200, 200))[1], 1)
+
+    def test_closing_twice_is_harmless(self):
+        pdfpreview.render_page(self.path, 0, box=(200, 200))
+        pdfpreview.close_open_document()
+        pdfpreview.close_open_document()
+
+    def test_it_still_renders_after_the_cache_is_dropped(self):
+        if pdfpreview.render_page(self.path, 0, box=(200, 200))[0] is None:
+            self.skipTest("this machine will not render the sample")
+        pdfpreview.close_open_document()
+        png, pages = pdfpreview.render_page(self.path, 2, box=(200, 200))
+        self.assertIsNotNone(png)
+        self.assertEqual(pages, 3)

@@ -13,9 +13,7 @@ from ctypes import wintypes
 
 ERROR_ALREADY_EXISTS = 183
 EVENT_MODIFY_STATE = 0x0002
-SYNCHRONIZE = 0x00100000
 WAIT_OBJECT_0 = 0
-WAIT_TIMEOUT = 258
 
 MUTEX_NAME = "Local\\QuickFind-SingleInstance"
 EVENT_NAME = "Local\\QuickFind-Show"

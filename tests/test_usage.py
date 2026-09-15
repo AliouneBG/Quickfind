@@ -187,3 +187,32 @@ class TestRankingWithHistory(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestCorruptStore(StoreTest):
+    """The store is built while the Controller is, so a crash here is fatal."""
+
+    def write_raw(self, text):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def test_entries_of_the_wrong_shape_costs_history_not_the_app(self):
+        # `stored` being a dict was checked; what was inside it was not, so a
+        # truncated or hand-edited store took the whole launcher down.
+        for text in ('{"entries": 5}', '{"entries": [1, 2]}',
+                     '{"entries": "x"}', '{"entries": null}'):
+            with self.subTest(text=text):
+                self.write_raw(text)
+                store = usage.UsageStore(self.path)
+                self.assertEqual(len(store._entries), 0)
+
+    def test_the_file_being_nonsense_costs_history_not_the_app(self):
+        for text in ("[1,2,3]", '"hello"', "42", "not json at all", ""):
+            with self.subTest(text=text):
+                self.write_raw(text)
+                self.assertEqual(len(usage.UsageStore(self.path)._entries), 0)
+
+    def test_a_good_store_still_loads(self):
+        self.store.record(os.path.join(HOME, "a.txt"), 1.0)
+        self.store.save()
+        self.assertEqual(len(usage.UsageStore(self.path)._entries), 1)

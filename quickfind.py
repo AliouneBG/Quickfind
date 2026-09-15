@@ -88,6 +88,37 @@ def config_path() -> str:
     return os.path.join(folder, "config.json")
 
 
+def usable(key: str, value):
+    """Is this a value the rest of the program can actually use?
+
+    A hand-edited config is the only way most of these go wrong, and the
+    failure it used to cause was the worst kind: `roots` written as a string
+    indexed "C", ":" and "\\" as three separate drives without complaining,
+    and a string where a number belonged took the whole app down on the first
+    keystroke. Launched through pythonw there is no console to show it in.
+    """
+    default = DEFAULT_CONFIG[key]
+    if key == "live_folders":
+        # Documented as either a switch or a list of paths to watch instead.
+        return isinstance(value, bool) or _is_string_list(value)
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, (int, float)):
+        # bool is an int in Python, and "watch_quiet_seconds": true is not a
+        # number anybody meant.
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if isinstance(default, list):
+        return _is_string_list(value)
+    if isinstance(default, str):
+        return isinstance(value, str)
+    return True
+
+
+def _is_string_list(value) -> bool:
+    return (isinstance(value, list)
+            and all(isinstance(item, str) for item in value))
+
+
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
     path = config_path()
@@ -100,7 +131,27 @@ def load_config() -> dict:
         print(f"config unreadable ({exc}); using defaults", file=sys.stderr)
         return cfg
 
+    if not isinstance(stored, dict):
+        # Valid JSON, but a list or a number rather than an object. Updating
+        # a dict from it raises, and the traceback went to a log nobody knew
+        # to look in while the app simply never appeared.
+        print(f"config is not a JSON object; using defaults", file=sys.stderr)
+        log(f"config at {path} is {type(stored).__name__}, not an object")
+        stored = {}
+
+    rejected = [key for key, value in stored.items()
+                if key in DEFAULT_CONFIG and not usable(key, value)]
+    for key in rejected:
+        log(f"config: ignoring {key}={stored[key]!r}, wrong type")
+        stored.pop(key)
+    if rejected:
+        print("ignoring settings with the wrong type: "
+              + ", ".join(sorted(rejected)), file=sys.stderr)
+
     cfg.update(stored)
+    # A number of the right type can still be nonsense.
+    if cfg["max_results"] < 1:
+        cfg["max_results"] = DEFAULT_CONFIG["max_results"]
     # `max_results` used to be how many rows were drawn, so forty was a sane
     # value. The list is now a viewport and the setting caps how many matches
     # it holds, so a config still carrying the old default would silently keep
@@ -110,14 +161,23 @@ def load_config() -> dict:
         stored = dict(stored)
         stored.pop("max_results")
 
-    if set(stored) != set(cfg):
+    if set(stored) != set(cfg) or rejected:
         # Write back so newly added settings are visible and editable rather
         # than being silent defaults the user has no way to discover.
+        #
+        # Through a temporary file, as the usage store already does: written
+        # in place, an interrupted write leaves truncated JSON, and that is
+        # exactly the corruption handled above.
+        temporary = path + ".tmp"
         try:
-            with open(path, "w", encoding="utf-8") as fh:
+            with open(temporary, "w", encoding="utf-8") as fh:
                 json.dump(cfg, fh, indent=2)
+            os.replace(temporary, path)
         except OSError:
-            pass
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
     return cfg
 
 
@@ -496,6 +556,18 @@ class Controller:
         if total is not None and total > len(results):
             more = "+" if self.searcher.last_total_capped else ""
             note = f"{len(results)} of {total:,}{more}"
+            hint = "  Add a word to narrow"
+        elif total is None and len(results) >= limit:
+            # A second word makes the true count prohibitively expensive:
+            # Searcher.search only tracks it for a single word, since getting
+            # an exact figure means resolving and filtering every candidate
+            # rather than stopping at `limit`. But filling the request exactly
+            # is itself proof there may be more behind it -- without this,
+            # a two-word query that fills all 2000 slots reads as "2000
+            # matches", indistinguishable from a file count that happens to be
+            # exactly 2000, and scrolling to the bottom of that list looks
+            # exactly like reaching the true end.
+            note = f"{len(results):,}+ matches"
             hint = "  Add a word to narrow"
         elif len(results) > screenful:
             # All of them are in the list; only a screenful is on show. The

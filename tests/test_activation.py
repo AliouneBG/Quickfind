@@ -233,6 +233,16 @@ class TestMissingPaths(unittest.TestCase):
              mock.patch.object(ui, "open_path", return_value=False):
             self.app._on_return(None)
         self.assertIn("Could not open", self.app.status.cget("text"))
+        # Setting the text was never the point. The launcher used to dismiss
+        # itself before trying to open, so the message went onto a window that
+        # was already gone -- the silent failure the case above exists to stop.
+        self.assertTrue(self.app.is_visible())
+
+    def test_a_successful_open_still_dismisses(self):
+        with mock.patch("os.path.exists", return_value=True), \
+             mock.patch.object(ui, "open_path", return_value=True):
+            self.app._on_return(None)
+        self.assertFalse(self.app.is_visible())
 
 
 class TestOpenerCommands(unittest.TestCase):

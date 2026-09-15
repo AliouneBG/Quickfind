@@ -901,6 +901,11 @@ class Launcher:
                     data, _type = self._icons.png_for(path, is_dir,
                                                       self.large_icons)
                     self._done.put(("icon", key, data))
+                elif kind == "closepdf":
+                    # The cached document keeps the file memory-mapped, which
+                    # stops anything truncating it in place. Fine while it is
+                    # the thing on screen; not fine indefinitely afterwards.
+                    pdfpreview.close_open_document()
                 elif kind == "page":
                     _, token, path, index, box = job
                     if token != self._page_token:
@@ -909,6 +914,9 @@ class Launcher:
                     self._done.put(("page", token, png, count))
                 elif kind == "preview":
                     _, token, path, is_dir = job
+                    if is_dir or not pdfpreview.is_pdf(path):
+                        # Moved on to something that is not a document.
+                        pdfpreview.close_open_document()
                     self._done.put(("preview", token, self._build_preview_data(
                         path, is_dir)))
                 elif kind == "video":
@@ -1036,6 +1044,7 @@ class Launcher:
         self._page_token += 1
         self.page_view.pack_forget()
         self.page_label.configure(image="", text="")
+        self._release_pdf()
         # `_sync_panels` reads the separator as "the panels are already up", so
         # leaving it packed would keep it from bringing the list back.
         self.separator.pack_forget()
@@ -1084,6 +1093,11 @@ class Launcher:
             keys = "Esc back"
         self.page_foot.configure(
             text="{}     {}".format(where, keys) if where else keys)
+
+    def _release_pdf(self) -> None:
+        """Ask the worker to let go of the document it is holding open."""
+        if self._worker is not None and self._worker.is_alive():
+            self._jobs.put(("closepdf",))
 
     def _request_page(self) -> None:
         self._page_token += 1
@@ -1498,6 +1512,7 @@ class Launcher:
                 setattr(self, attr, None)
         self._stop_video()
         self._close_page_view()
+        self._release_pdf()
         self._anim_offset = 0
         if was_visible:
             self._fade_out()
@@ -1947,10 +1962,13 @@ class Launcher:
             # The index is a snapshot; say so rather than failing silently.
             self.set_status(f"No longer on disk: {target}")
             return "break"
-        self.hide()
+        # Opened first, dismissed after: `set_status` on a window that has
+        # already been hidden writes a message nobody can read, which is the
+        # same silent failure the missing-file case above exists to avoid.
         if not opener(target):
             self.set_status(f"Could not open: {target}")
             return "break"
+        self.hide()
         record = getattr(self.controller, "record_use", None)
         if record is not None:
             record(target, weight)

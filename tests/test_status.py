@@ -140,6 +140,28 @@ class TestStatusLine(unittest.TestCase):
         _results, note = self.build([r"C:\a\solo.txt"], "zzznothing")
         self.assertIn("No matches", note)
 
+    def test_a_second_word_that_fills_the_list_still_hints_at_more(self):
+        # Searcher.last_total is None once a second word is typed -- an exact
+        # count means resolving and filtering every candidate, which is what
+        # stopping at `limit` avoids. Filling the request exactly is itself
+        # the signal: without it this read as "40 matches", indistinguishable
+        # from a true count of 40, and scrolling to the bottom looked exactly
+        # like reaching the real end.
+        paths = [rf"C:\bucket\note{n:03d} report.txt" for n in range(60)]
+        _results, note = self.build(paths, "note report", limit=40)
+        self.assertIn("40+", note)
+        self.assertIn("Add a word to narrow", note)
+
+    def test_a_second_word_that_does_not_fill_the_list_is_exact(self):
+        # Fewer results than asked for is proof positive there is no more:
+        # the search only stops early when it runs out of candidates.
+        paths = [rf"C:\bucket\note{n:03d} report.txt" for n in range(20)]
+        _results, note = self.build(paths, "note report", limit=40)
+        self.assertIn("20 matches", note)
+        # Not "Ctrl+Enter"'s own "+": the truncation marker sits on the count.
+        self.assertNotIn("20+", note)
+        self.assertNotIn("Add a word", note)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

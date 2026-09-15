@@ -15,6 +15,7 @@ from __future__ import annotations
 import ctypes
 import os
 import struct
+import threading
 import tempfile
 import time
 from ctypes import wintypes
@@ -97,6 +98,45 @@ class Size(ctypes.Structure):
 # assuming that everywhere would crop the pane on a machine where it is 1. So
 # it is measured from the first page rendered and remembered.
 _scale = None
+
+# The document last opened, kept so that turning a page does not re-open the
+# file. Two reasons, and the second is the one that matters.
+#
+# Speed: a page cost 73ms, nearly all of it opening and parsing, against about
+# 10ms to draw another page of a document already open.
+#
+# Handles: `GetFileFromPathAsync` leaks one process handle per call, inside
+# Windows.Storage rather than here. Measured, it never plateaus -- 300 opens
+# took the process from 292 handles to 567, exactly one per call -- and
+# neither releasing the StorageFile, closing it through IClosable, nor letting
+# the thread and its apartment die reclaims it. Reading a ten page document
+# therefore used to cost ten handles; now it costs one.
+#
+# The cache holds an apartment reference of its own, because RoUninitialize
+# dropping the last one would invalidate every pointer it is holding. It is
+# used only from the thread that filled it, which in the application is the
+# one shell worker, so the pointers never cross an apartment.
+_open = None
+
+
+def _forget_open() -> None:
+    """Release the cached document and give back its apartment reference."""
+    global _open
+    if _open is None:
+        return
+    cached, _open = _open, None
+    for handle in reversed(cached["handles"]):
+        _release(handle)
+    combase.RoUninitialize()
+
+
+def _stamp(path: str):
+    """Identity of a file for cache purposes: reopen it if it has changed."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (os.path.abspath(path).lower(), info.st_mtime_ns, info.st_size)
 
 
 def is_pdf(path: str) -> bool:
@@ -302,29 +342,63 @@ def render_page(path: str, index: int = 0, box=(440, 340),
     if started not in (S_OK, S_FALSE, RPC_E_CHANGED_MODE):
         return None, 0
 
+    # Pointers that belong to this call alone, released before it returns.
     handles = []
+    global _open
+    mine = threading.get_ident()
+    stamp = _stamp(path)
+    reusable = (_open is not None and _open["owner"] == mine
+                and stamp is not None and _open["stamp"] == stamp
+                and started in (S_OK, S_FALSE))
     try:
-        storage = _factory(CLASS_STORAGE_FILE, IID_STORAGE_FILE_STATICS)
-        handles.append(storage)
-        pdf = _factory(CLASS_PDF_DOCUMENT, IID_PDF_DOCUMENT_STATICS)
-        handles.append(pdf)
+        if reusable:
+            storage = _open["storage"]
+            document = _open["document"]
+            pages = ctypes.c_uint32(_open["pages"])
+        else:
+            # Only the thread that filled the cache may empty it, so that a
+            # pointer is never released from another apartment.
+            if _open is not None and _open["owner"] == mine:
+                _forget_open()
+            kept = []
+            storage = _factory(CLASS_STORAGE_FILE, IID_STORAGE_FILE_STATICS)
+            kept.append(storage)
+            pdf = _factory(CLASS_PDF_DOCUMENT, IID_PDF_DOCUMENT_STATICS)
+            kept.append(pdf)
 
-        source = _storage_file(storage, path)
-        handles.append(source)
-        operation = ctypes.c_void_p()
-        if _method(pdf, PDF_LOAD_FROM_FILE, ctypes.c_long, ctypes.c_void_p,
-                   ctypes.POINTER(ctypes.c_void_p))(
-                pdf, source, ctypes.byref(operation)) != 0:
-            return None, 0
-        handles.append(operation)
-        document = _result(operation)
-        handles.append(document)
+            source = _storage_file(storage, path)
+            kept.append(source)
+            operation = ctypes.c_void_p()
+            if _method(pdf, PDF_LOAD_FROM_FILE, ctypes.c_long, ctypes.c_void_p,
+                       ctypes.POINTER(ctypes.c_void_p))(
+                    pdf, source, ctypes.byref(operation)) != 0:
+                handles.extend(kept)
+                return None, 0
+            kept.append(operation)
+            document = _result(operation)
+            kept.append(document)
 
-        pages = ctypes.c_uint32(0)
-        _method(document, PDF_GET_PAGE_COUNT, ctypes.c_long,
-                ctypes.POINTER(ctypes.c_uint32))(document, ctypes.byref(pages))
-        if not pages.value:
-            return None, 0
+            pages = ctypes.c_uint32(0)
+            _method(document, PDF_GET_PAGE_COUNT, ctypes.c_long,
+                    ctypes.POINTER(ctypes.c_uint32))(
+                document, ctypes.byref(pages))
+            if not pages.value:
+                handles.extend(kept)
+                return None, 0
+
+            if stamp is None or started not in (S_OK, S_FALSE):
+                # Nothing to key the cache on, or an apartment this call did
+                # not open: keep the old behaviour and free it all on the way
+                # out rather than holding pointers we cannot vouch for.
+                handles.extend(kept)
+            else:
+                # The cache takes an apartment reference of its own so that
+                # the RoUninitialize at the end of this call cannot pull the
+                # ground out from under the pointers it is keeping.
+                combase.RoInitialize(RO_INIT_MULTITHREADED)
+                _open = {"owner": mine, "stamp": stamp, "handles": kept,
+                         "storage": storage, "document": document,
+                         "pages": pages.value}
 
         if not 0 <= index < pages.value:
             return None, pages.value
@@ -355,9 +429,18 @@ def render_page(path: str, index: int = 0, box=(440, 340),
                 png = again
         return png, pages.value
     except Exception:
+        # A half-built cache entry cannot be trusted, and this is also where a
+        # file that changed underneath an open document lands.
+        if _open is not None and _open["owner"] == mine:
+            _forget_open()
         return None, 0
     finally:
         for handle in reversed(handles):
             _release(handle)
         if started in (S_OK, S_FALSE):
             combase.RoUninitialize()
+
+
+def close_open_document() -> None:
+    """Drop the cached document. Call from the thread that rendered."""
+    _forget_open()

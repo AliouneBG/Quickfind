@@ -71,3 +71,89 @@ class TestLoadConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestHostileConfig(unittest.TestCase):
+    """A hand-edited config used to be able to stop the app starting at all."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "config.json")
+        self._real = quickfind.config_path
+        quickfind.config_path = lambda: self.path
+
+    def tearDown(self):
+        quickfind.config_path = self._real
+        self.tmp.cleanup()
+
+    def write_raw(self, text):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def test_valid_json_that_is_not_an_object_falls_back(self):
+        # Each of these raised out of dict.update, and the traceback went to a
+        # log file while the window simply never appeared.
+        for text in ("[1, 2, 3]", '"hello"', "42", "null"):
+            with self.subTest(text=text):
+                self.write_raw(text)
+                cfg = quickfind.load_config()
+                self.assertEqual(cfg["roots"], quickfind.DEFAULT_CONFIG["roots"])
+                self.assertEqual(cfg["max_results"],
+                                 quickfind.DEFAULT_CONFIG["max_results"])
+
+    def test_a_setting_of_the_wrong_type_is_ignored(self):
+        self.write_raw(json.dumps({"max_results": "lots", "opacity": "high"}))
+        cfg = quickfind.load_config()
+        self.assertEqual(cfg["max_results"],
+                         quickfind.DEFAULT_CONFIG["max_results"])
+        self.assertEqual(cfg["opacity"], quickfind.DEFAULT_CONFIG["opacity"])
+
+    def test_roots_as_a_bare_string_is_ignored(self):
+        # The quiet one: "C:\\" iterates as three one-character roots, so the
+        # index came back almost empty with nothing reported.
+        self.write_raw(json.dumps({"roots": "C:\\"}))
+        cfg = quickfind.load_config()
+        self.assertEqual(cfg["roots"], quickfind.DEFAULT_CONFIG["roots"])
+
+    def test_a_list_of_non_strings_is_ignored(self):
+        self.write_raw(json.dumps({"excludes": [1, 2, 3]}))
+        cfg = quickfind.load_config()
+        self.assertEqual(cfg["excludes"],
+                         quickfind.DEFAULT_CONFIG["excludes"])
+
+    def test_true_is_not_a_number(self):
+        # bool is an int in Python, so this needs saying explicitly.
+        self.write_raw(json.dumps({"watch_quiet_seconds": True}))
+        cfg = quickfind.load_config()
+        self.assertEqual(cfg["watch_quiet_seconds"],
+                         quickfind.DEFAULT_CONFIG["watch_quiet_seconds"])
+
+    def test_a_nonsense_number_is_replaced(self):
+        self.write_raw(json.dumps({"max_results": -5}))
+        cfg = quickfind.load_config()
+        self.assertGreater(cfg["max_results"], 0)
+
+    def test_live_folders_takes_a_switch_or_a_list(self):
+        for value in (True, False, [r"C:\Downloads"]):
+            with self.subTest(value=value):
+                self.write_raw(json.dumps({"live_folders": value}))
+                self.assertEqual(quickfind.load_config()["live_folders"], value)
+        self.write_raw(json.dumps({"live_folders": 7}))
+        self.assertEqual(quickfind.load_config()["live_folders"],
+                         quickfind.DEFAULT_CONFIG["live_folders"])
+
+    def test_good_settings_alongside_bad_ones_survive(self):
+        self.write_raw(json.dumps({"max_results": "lots", "opacity": 0.5}))
+        cfg = quickfind.load_config()
+        self.assertEqual(cfg["opacity"], 0.5)
+        self.assertEqual(cfg["max_results"],
+                         quickfind.DEFAULT_CONFIG["max_results"])
+
+    def test_the_rewrite_leaves_no_temporary_behind(self):
+        self.write_raw(json.dumps({"max_results": "lots"}))
+        quickfind.load_config()
+        self.assertFalse(os.path.exists(self.path + ".tmp"))
+        # And what it wrote back is loadable, with the bad value gone.
+        with open(self.path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["max_results"],
+                             quickfind.DEFAULT_CONFIG["max_results"])
